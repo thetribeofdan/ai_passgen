@@ -1,0 +1,16 @@
+[package]
+name = "ai_passgen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.42"
+clap = { version = "4.5.51", features = ["derive"] }
+rand = "0.8"
+rayon = "1.8"
+sha2 = "0.10"
+hex = "0.4"
+md5 = "0.8.0"
+bcrypt = "0.17.1"
+argon2 = "0.5"
+num_cpus = "1.17.0"
