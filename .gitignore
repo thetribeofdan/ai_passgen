@@ -1,4 +1,20 @@
-/target
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc.*
+*.egg-info/
+
+
 .env
-/venv
+venv/
 output/
+
+# Rust
+/target
+Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db

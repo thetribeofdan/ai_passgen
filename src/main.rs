@@ -1,23 +1,15 @@
 use clap::{Arg, Command};
 use chrono::Local;
 use std::fs::{self, File};
-use std::io::{Write, Read};
+use std::io::{Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use sha2::{Sha256, Sha512, Digest};
-use md5;
-use bcrypt::{verify, hash as bcrypt_hash};
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
-use argon2::password_hash::{PasswordHash};
 use rand::thread_rng;
 mod cracker;
 use crate::cracker::{crack_passwords_multithread};
 use num_cpus;
-use std::io::{BufRead, BufReader};
 mod hash_detect;
 use crate::hash_detect::detect_hash_algo;
-use rand::rngs::OsRng;
-use argon2::password_hash::SaltString;
 use rand::Rng;
 
 
@@ -120,7 +112,6 @@ fn main() {
     // STEP 1 — Generate passwords (AI or fallback)
     // ------------------------------------------------------------
     let generation_result: Result<(), ()> = match run_python_ai(&input_path,
-    &output_path,
     length,
     amount,
     matches.get_one::<String>("algo").map(|s| s.as_str()),
@@ -181,14 +172,26 @@ fn main() {
         // NORMAL MODE (user specified amount or length)
         // --------------------------------------------------------
         if !infinite_mode {
-            let passwords = load_passwords_from_output(&output_path);
+            let passwords = match run_python_ai(
+                    &input_path,
+                    length,
+                    amount,
+                    matches.get_one::<String>("algo").map(|s| s.as_str()),
+                    max_threads,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("AI generation failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
             let result = crack_passwords_multithread(
-                passwords,
-                hash_to_crack.clone(),
-                algo,
-                max_threads,
-            );
+                    passwords,
+                    hash_to_crack.clone(),
+                    algo,
+                    max_threads,
+                );
 
             if result.cracked {
                 println!("MATCH FOUND!");
@@ -219,23 +222,22 @@ fn main() {
             println!("→ Generating {} passwords", batch_size);
             println!("→ Length {}", length);
 
-            let temp_output = Path::new("output/infinite_run.txt");
+            // let temp_output = Path::new("output/infinite_run.txt");
 
             // 1. Generate batch using AI
-            if let Err(e) = run_python_ai(
+            let passwords = match run_python_ai(
                 &input_path,
-                temp_output,
                 length,
                 batch_size,
                 matches.get_one::<String>("algo").map(|s| s.as_str()),
                 max_threads,
             ) {
-                eprintln!("AI batch generation failed: {}", e);
-                std::process::exit(1);
-            }
-
-            // 2. Load passwords
-            let passwords = load_passwords_from_output(temp_output);
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("AI batch generation failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
             // 3. Crack batch
             let result = crack_passwords_multithread(
@@ -273,13 +275,13 @@ fn main() {
 /// ------------------------------------------------------------
 fn run_python_ai(
     input_file: &Path,
-    output_file: &Path,
     length: usize,
     amount: usize,
     algo: Option<&str>,       // NEW OPTIONAL FIELDS
     threads: Option<usize>,
-) -> std::io::Result<()> 
+) -> std::io::Result<Vec<String>> 
 {
+    
     #[cfg(target_os = "windows")]
     let venv_python = Path::new("venv").join("Scripts").join("python.exe");
 
@@ -291,7 +293,8 @@ fn run_python_ai(
     } else {
         println!("No virtual environment found. Creating one...");
         let status = ProcessCommand::new("python")
-            .arg("-m").arg("venv").arg("venv")
+            .arg("-m").arg("venv")
+            .arg("venv")
             .status()
             .expect("Failed to create virtual environment");
 
@@ -304,16 +307,17 @@ fn run_python_ai(
     };
 
     let mut cmd = ProcessCommand::new(&python_path);
+
     cmd.arg("ai_logic/main.py")
         .arg("--input").arg(input_file)
-        .arg("--output").arg(output_file)
         .arg("--length").arg(length.to_string())
         .arg("--amount").arg(amount.to_string());
 
-    // PASS OPTIONAL FIELDS ONLY IF PROVIDED
+    // optional parameters
     if let Some(a) = algo {
         cmd.arg("--algo").arg(a);
     }
+
     if let Some(t) = threads {
         cmd.arg("--threads").arg(t.to_string());
     }
@@ -325,15 +329,24 @@ fn run_python_ai(
 
     if !output.status.success() {
         eprintln!("Python stderr:\n{}", String::from_utf8_lossy(&output.stderr));
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Python script failed"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Python script failed",
+        ));
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    if !stdout_str.trim().is_empty() {
-        println!("Python stdout:\n{}", stdout_str);
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // println!("Raw Python stdout:\n{}", stdout);
 
-    Ok(())
+    let passwords: Vec<String> = stdout
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    
+    // println!("Received {} passwords", passwords.len());
+
+    Ok(passwords)
 }
 
 /// ------------------------------------------------------------
@@ -352,79 +365,6 @@ fn generate_password(length: usize) -> String {
         })
         .collect()
 }
-
-/// ------------------------------------------------------------
-/// HASH CRACKING
-/// ------------------------------------------------------------
-fn crack_hash(output_file: &Path, target_hash: &str, algo: &str) -> Option<String> {
-    let mut file_contents = String::new();
-    File::open(output_file)
-        .expect("Failed to open password file")
-        .read_to_string(&mut file_contents)
-        .expect("Failed to read file");
-
-    for line in file_contents.lines() {
-        let pwd = line.trim();
-
-        if is_password_match(pwd, target_hash, algo) {
-            return Some(pwd.to_string());
-        }
-    }
-
-    None
-}
-
-fn is_password_match(password: &str, target_hash: &str, algo: &str) -> bool {
-    match algo {
-        "sha256" => hash_password(password, "sha256") == target_hash,
-        "sha512" => hash_password(password, "sha512") == target_hash,
-        "md5" => hash_password(password, "md5") == target_hash,
-        "bcrypt" => verify(password, target_hash).unwrap_or(false),
-        "argon2" => {
-            if let Ok(parsed) = PasswordHash::new(target_hash) {
-                Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
-            } else {
-                false
-            }
-        }
-        _ => false
-    }
-}
-
-/// ------------------------------------------------------------
-/// HASHING
-/// ------------------------------------------------------------
-fn hash_password(password: &str, algo: &str) -> String {
-    match algo {
-        "sha256" => {
-            let mut hasher = Sha256::new();
-            hasher.update(password.as_bytes());
-            format!("{:x}", hasher.finalize())
-        }
-        "sha512" => {
-            let mut hasher = Sha512::new();
-            hasher.update(password.as_bytes());
-            format!("{:x}", hasher.finalize())
-        }
-        "md5" => format!("{:x}", md5::compute(password.as_bytes())),
-
-        "bcrypt" => bcrypt_hash(password, 12).unwrap_or_default(),
-
-        "argon2" => {
-
-            let argon = Argon2::default();
-            let salt = SaltString::generate(&mut OsRng);
-
-            argon
-                .hash_password(password.as_bytes(), &salt)
-                .unwrap()
-                .to_string()
-        }
-
-        _ => panic!("Unsupported hash algorithm: {}", algo),
-    }
-}
-
 
 /// ------------------------------------------------------------
 /// HELPERS
@@ -454,15 +394,7 @@ fn generate_default_output_path(input_path: &Path) -> PathBuf {
 }
 
 // fn load_passwords_from_output(output_file: &Path) -> Vec<String> {
-//     let file = File::open(output_file)
-//         .expect("Failed to open generated password file");
-
+//     let file = File::open(output_file).expect("Failed to open generated password file");
 //     let reader = BufReader::new(file);
 //     reader.lines().filter_map(Result::ok).collect()
 // }
-
-fn load_passwords_from_output(output_file: &Path) -> Vec<String> {
-    let file = File::open(output_file).expect("Failed to open generated password file");
-    let reader = BufReader::new(file);
-    reader.lines().filter_map(Result::ok).collect()
-}

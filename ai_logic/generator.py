@@ -36,7 +36,7 @@ def generate_passwords(persona: dict, length: int = 10, amount: int = 20):
         f"- Avoid common-passwords (reject known weak passwords like 'password', '12345678', 'qwerty'). \n"
         f"- Return exactly {amount} newline-separated passwords, no numbering, no extra text. \n"
         f"Generation rules summary: \n"
-        f"Prefer whole meaningful words or short meaningful fragments (e.g., Blue, Buddy, Incept, Sushi, NY, 2015, Read, Code, 2 digits out a year instead of the full year, the calculated age of the persona or age of relatives if given).\n"
+        f"Prefer whole meaningful words or short meaningful fragments (i.e., 2 digits out a year instead of the full year, the calculated age of the persona or age of relatives if given).\n"
         f"- Use templates like these: [TokenA][Symbol][TokenB][Digits], [Digits][TokenA][TokenB][Symbol], [TokenA][TokenB][Symbol][Digits], [TokenA][TokenB][Digits][Symbol], [TokenA][TokenB][Digits] \n"
         f"You can also switch around the arrangement of the template example given and trim tokens to meaningful prefixes if needed to meet exact length. \n"
         f"- If padding is needed, prefer persona-derived short tokens (NY, JD, Run) rather than random letters. \n"

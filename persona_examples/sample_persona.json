@@ -1,18 +1,18 @@
 {
-  "name": "Jane Doe",
+  "name": "John Harpy",
   "hobbies": ["reading", "coding", "music", "movies"],
-  "favorite_food": "sushi",
-  "username" : "jdoe123",
+  "favorite_food": "bacon",
+  "username" : "pirateking23",
   "gender": "male",
-  "dob": "01-01-2000",
-  "favourite_color": "blue",
-  "favourite_movies": ["Inception", "The Matrix", "Interstellar"],
+  "dob": "01-02-2003",
+  "favourite_color": "Blue",
+  "favourite_movies": ["Inception", "The Matrix", "Interstellar", "Pirates of the Carribian"],
   "pet_name": "Buddy",
   "pet": "dog",
-  "father's_name": "John",
-  "mother's_name": "Mary",
-  "siblings": ["Alice", "Bob"],
-  "birthplace": "New York",
+  "father's_name": "Dicky",
+  "mother's_name": "Jane",
+  "siblings": ["Jenny", "Harry"],
+  "birthplace": "Canada",
   "graduation_year": "2015"
 
 }

@@ -17,7 +17,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="AI-based password generator")
 
     parser.add_argument("--input", required=True, help="Path to persona input file")
-    parser.add_argument("--output", required=True, help="Path to output password file")
+    # parser.add_argument("--output", required=True, help="Path to output password file")
     parser.add_argument("--length", type=int, default=10, help="Password length")
     parser.add_argument("--amount", type=int, default=20, help="Number of passwords")
 
@@ -39,13 +39,8 @@ def main():
     # Generate passwords using AI or fallback
     passwords = generate_passwords(persona, args.length, args.amount)
 
-    # Write passwords to output file
-    with open(args.output, "w") as f:
-        for p in passwords:
-            f.write(p + "\n")
-
-    # Print values so Rust can use them if needed
-    print(f"Generated {len(passwords)} passwords")
+    for p in passwords:
+        print(p, flush=True)
 
 
 if __name__ == "__main__":
