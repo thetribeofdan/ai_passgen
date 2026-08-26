@@ -1,83 +1,146 @@
+import json
 import os
-from openai import OpenAI
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+import re
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
-def generate_passwords(persona: dict, length: int = 10, amount: int = 20):
-    """
-    Generates passwords using OpenAI API.
-    Falls back to dummy passwords if OpenAI is unavailable.
-    """
-    # if openai is None:
-    #     print("Warning: openai package not installed. Generating dummy passwords.")
-    #     return generate_dummy_passwords(persona, length, amount)
+DEFAULT_MODEL = "DanTheBadGuy/ai-passgen-gpt-oss-20b-lora-v2"
+DEFAULT_PATTERNS = [
+    "{token}{year}",
+    "{token}{number}",
+    "{token}{symbol}{number}",
+    "{token1}{token2}{number}",
+]
 
-    openai = OpenAI()
 
-    openai.api_key = (os.getenv("OPENAI_API_KEY"))
-    if not openai.api_key:
-        print("Warning: OPENAI_API_KEY not set. Using dummy passwords.")
-        return generate_dummy_passwords(persona, length, amount)
+def generate_search_space(persona: dict) -> dict:
+    """Ask the model for concepts, then use a safe offline fallback."""
+    response = request_huggingface(build_prompt(persona))
+    if response is not None:
+        try:
+            return validate_search_space(response)
+        except ValueError:
+            pass
+    return fallback_search_space(persona)
 
-    # Construct persona description
-    persona_description = "\n".join(f"{k}: {v}" for k, v in persona.items())
-    prompt = (
-        f"You are a password-generation assistant: {persona_description}\n"
-        f"Generate {amount} strong but memorable passwords for a user with the following traits:\n"
-        f"Task: \n"
-        f"- Generate {amount} unique passwords, each exactly {length} characters long. Each password must:\n"
-        f"- Contain at least one uppercase letter, one lowercase letter, one digit, and one special character (!, @, #, $, %, ^, &, *, ?, ., <, >) \n"
-        f"- Be human-memorable: every substring/token (not random single letters) must map to a meaningful element of the persona (name, pet, favorite color, movie fragment, hobby, birthplace, graduation year fragment, etc.) \n"
-        f"- Use a variety of special characters across the set (do not always use the same symbol) \n"
-        f"- Avoid including any fields listed in avoid_fields or any full sensitive numbers flagged in policies. \n"
-        f"- Avoid common-passwords (reject known weak passwords like 'password', '12345678', 'qwerty'). \n"
-        f"- Return exactly {amount} newline-separated passwords, no numbering, no extra text. \n"
-        f"Generation rules summary: \n"
-        f"Prefer whole meaningful words or short meaningful fragments (i.e., 2 digits out a year instead of the full year, the calculated age of the persona or age of relatives if given).\n"
-        f"- Use templates like these: [TokenA][Symbol][TokenB][Digits], [Digits][TokenA][TokenB][Symbol], [TokenA][TokenB][Symbol][Digits], [TokenA][TokenB][Digits][Symbol], [TokenA][TokenB][Digits] \n"
-        f"You can also switch around the arrangement of the template example given and trim tokens to meaningful prefixes if needed to meet exact length. \n"
-        f"- If padding is needed, prefer persona-derived short tokens (NY, JD, Run) rather than random letters. \n"
-        f"Output format: newline-separated passwords only. \n"
+
+def build_prompt(persona: dict) -> str:
+    persona_json = json.dumps(persona, ensure_ascii=True, sort_keys=True)
+    return (
+        "You are a cybersecurity research model. Infer likely concepts from "
+        "this fictional persona, but never generate passwords. Return only a "
+        "JSON object with arrays named primary_tokens, secondary_tokens, "
+        "important_numbers, preferred_symbols, and likely_patterns. Use only "
+        "{token}, {token1}, {token2}, {number}, {year}, and {symbol}. "
+        "Keep unsupported details out of the result. Persona: "
+        f"{persona_json}"
     )
 
+
+def request_huggingface(prompt: str) -> dict | None:
+    model_url = os.getenv("HF_INFERENCE_URL")
+    if not model_url:
+        model_id = os.getenv("HF_MODEL_ID", DEFAULT_MODEL)
+        model_url = f"https://api-inference.huggingface.co/models/{model_id}"
+
+    token = os.getenv("HF_TOKEN")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    request = Request(
+        model_url,
+        data=json.dumps(
+            {"inputs": prompt, "parameters": {"max_new_tokens": 512}}
+        ).encode(),
+        headers=headers,
+        method="POST",
+    )
     try:
-        response = openai.responses.create(
-            model="gpt-5-mini",
-            # reasoning={"effort": "high"},
-            input=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            # max_output_tokens=10000,
+        with urlopen(request, timeout=60) as result:
+            payload = json.loads(result.read().decode())
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        generated = payload[0].get("generated_text")
+        return extract_json(generated) if isinstance(generated, str) else None
+    if isinstance(payload, dict):
+        generated = payload.get("generated_text") or payload.get("text")
+        return (
+            extract_json(generated) if isinstance(generated, str) else payload
         )
-
-        # print(f"AI response: {response}")
-        text = response.output_text.strip()
-        passwords = [line.strip()[:length] for line in text.splitlines() if line.strip()]
-
-        return passwords
-
-    except Exception as e:
-        print(f"AI generation failed: {e}. Falling back to dummy passwords.")
-        return generate_dummy_passwords(persona, length, amount)
+    return None
 
 
-def generate_dummy_passwords(persona: dict, length: int, amount: int):
-    """
-    Fallback dummy password generator.
-    """
-    name = persona.get("name", "user").lower().replace(" ", "")
-    passwords = []
-    for i in range(1, amount + 1):
-        pwd = f"{name}{i:02d}"
-        if len(pwd) < length:
-            pwd = pwd.ljust(length, "x")
-        elif len(pwd) > length:
-            pwd = pwd[:length]
-        passwords.append(pwd)
-    return passwords
+def extract_json(text: str) -> dict | None:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "primary_tokens" in value:
+            return value
+    return None
+
+
+def validate_search_space(value: dict) -> dict:
+    fields = [
+        "primary_tokens",
+        "secondary_tokens",
+        "important_numbers",
+        "preferred_symbols",
+        "likely_patterns",
+    ]
+    result = {field: value.get(field, []) for field in fields}
+    for field in fields:
+        if not isinstance(result[field], list) or not all(
+            isinstance(item, str) for item in result[field]
+        ):
+            raise ValueError(f"{field} must be an array of strings")
+    if not result["primary_tokens"] and not result["secondary_tokens"]:
+        raise ValueError("model returned no tokens")
+    result["preferred_symbols"] = [
+        symbol for symbol in result["preferred_symbols"] if len(symbol) == 1
+    ]
+    result["likely_patterns"] = [
+        pattern
+        for pattern in result["likely_patterns"]
+        if pattern in DEFAULT_PATTERNS
+    ]
+    result["likely_patterns"] = result["likely_patterns"] or DEFAULT_PATTERNS
+    return result
+
+
+def fallback_search_space(persona: dict) -> dict:
+    primary = []
+    secondary = []
+    numbers = []
+    for key in ("name", "username", "pet_name"):
+        value = persona.get(key)
+        if isinstance(value, str) and value.strip():
+            primary.append(value.strip().replace(" ", ""))
+    for key in (
+        "hobbies",
+        "favourite_color",
+        "favorite_color",
+        "birthplace",
+        "favourite_movies",
+        "favorite_movies",
+    ):
+        value = persona.get(key)
+        values = value if isinstance(value, list) else [value]
+        secondary.extend(str(item).replace(" ", "") for item in values if item)
+    for key in ("dob", "graduation_year"):
+        value = persona.get(key)
+        if value:
+            numbers.append(str(value)[-4:])
+    return validate_search_space({
+        "primary_tokens": primary or ["user"],
+        "secondary_tokens": secondary,
+        "important_numbers": numbers,
+        "preferred_symbols": ["!", "@", "#"],
+        "likely_patterns": DEFAULT_PATTERNS,
+    })
