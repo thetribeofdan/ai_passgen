@@ -1,4 +1,5 @@
 # AI-PassGen
+
 ### AI-Assisted Password Generation and Hash Cracking Research Tool
 
 AI-PassGen is a **research-oriented password analysis tool** designed to explore how **AI-generated, persona-based password dictionaries** can improve password cracking strategies.
@@ -63,6 +64,7 @@ The generated passwords are then tested against a provided hash using a **high-p
 # Features
 
 ### AI Password Generation
+
 Generates passwords derived from persona attributes using an LLM.
 
 Examples of persona attributes:
@@ -91,9 +93,7 @@ All CPU cores are used by default.
 
 You can optionally limit threads with:
 
-
 --threads N
-
 
 ---
 
@@ -103,13 +103,13 @@ If no algorithm is provided, the system automatically attempts to detect the has
 
 Examples:
 
-| Hash Prefix | Detected Algorithm |
-|--------------|-------------------|
-| `$2a$`, `$2b$` | bcrypt |
-| `$argon2` | argon2 |
-| 64 hex chars | sha256 |
-| 128 hex chars | sha512 |
-| 32 hex chars | md5 |
+| Hash Prefix    | Detected Algorithm |
+| -------------- | ------------------ |
+| `$2a$`, `$2b$` | bcrypt             |
+| `$argon2`      | argon2             |
+| 64 hex chars   | sha256             |
+| 128 hex chars  | sha512             |
+| 32 hex chars   | md5                |
 
 ---
 
@@ -138,7 +138,6 @@ This allows the tool to **automatically escalate attacks**.
 Instead of generic dictionaries like:
 rockyou.txt
 
-
 AI-PassGen produces **target-specific password sets**, dramatically reducing search space.
 
 ---
@@ -146,3 +145,40 @@ AI-PassGen produces **target-specific password sets**, dramatically reducing sea
 # Architecture
 
 AI-PassGen is built using a **hybrid Rust + Python architecture**.
+
+## Current Model Boundary
+
+The Python process is responsible for one semantic operation: converting a
+persona into a structured search-space JSON object. It does not generate
+password strings. By default it calls the Hugging Face inference route for
+`DanTheBadGuy/ai-passgen-gpt-oss-20b-lora-v2`; set `HF_MODEL_ID` to use another
+model or `HF_INFERENCE_URL` to use a deployed endpoint. Authentication uses
+the `HF_TOKEN` environment variable.
+
+The Rust process deserializes and validates that JSON, then expands tokens,
+numbers, symbols, patterns, and case variants locally. Duplicate candidates
+are removed before they are written or passed to the Rayon-based verifier.
+
+Example model output:
+
+```json
+{
+  "primary_tokens": ["Daniel"],
+  "secondary_tokens": ["Arsenal"],
+  "important_numbers": ["1999"],
+  "preferred_symbols": ["@", "!"],
+  "likely_patterns": ["{token}{year}", "{token}{symbol}{number}"]
+}
+```
+
+The model request is performed once per generation batch. Rust owns the
+deterministic expansion and applies the requested candidate limit. When the
+Hugging Face endpoint is unavailable, Python creates a local search space from
+the supplied persona so development and reproducible tests do not require a
+network connection.
+
+Set `HF_TOKEN` before running the CLI when using a Hugging Face endpoint:
+
+```text
+HF_TOKEN=your_token cargo run -- --input persona_examples/sample_persona.json --length 10 --amount 20
+```
