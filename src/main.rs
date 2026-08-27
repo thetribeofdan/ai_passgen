@@ -1,19 +1,18 @@
 use chrono::Local;
 use clap::{Arg, Command};
-use rand::thread_rng;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 mod cracker;
-use crate::cracker::crack_passwords_multithread;
+use crate::cracker::{crack_passwords_multithread, is_supported_algorithm};
 use num_cpus;
 mod hash_detect;
 use crate::hash_detect::detect_hash_algo;
-use rand::Rng;
 mod expander;
 mod search_space;
-use crate::expander::expand_candidates;
+use crate::expander::{expand_candidates, expand_ranked_candidates};
 use crate::search_space::SearchSpace;
 
 /// ------------------------------------------------------------
@@ -23,7 +22,7 @@ fn main() {
     let matches = Command::new("Password Generator")
         .version("1.5.0")
         .author("Daniel Egbeleke")
-        .about("Generates AI-influenced passwords and optionally attempts to crack a provided hash.")
+        .about("Expands an LLM search space and optionally verifies candidates against a hash.")
         .arg(
             Arg::new("input")
                 .short('i')
@@ -45,7 +44,7 @@ fn main() {
                 .short('l')
                 .long("length")
                 .value_name("LENGTH")
-                .help("Length of each generated password (default: 10)")
+                .help("Length of each generated password (default: 12)")
                 .num_args(1),
         )
         .arg(
@@ -85,8 +84,14 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| get_default_persona_file());
 
-    if !input_path.exists() {
-        eprintln!("Error: input file not found: {:?}", input_path);
+    if matches.get_one::<String>("crack").is_some() && matches.get_one::<String>("input").is_none()
+    {
+        eprintln!("Crack mode requires --input PATH_TO_PERSONA_JSON.");
+        std::process::exit(2);
+    }
+
+    if !input_path.is_file() {
+        eprintln!("Error: persona JSON file not found: {:?}", input_path);
         std::process::exit(1);
     }
 
@@ -96,69 +101,33 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| generate_default_output_path(&input_path));
 
-    let length = matches
+    let requested_length = matches
         .get_one::<String>("length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10);
+        .and_then(|v| v.parse::<usize>().ok());
+
+    let length = requested_length.unwrap_or(12);
 
     let amount = matches
         .get_one::<String>("amount")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(20);
+        .unwrap_or(2000);
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).expect("Failed to create output directory");
     }
 
-    // ------------------------------------------------------------
-    // STEP 1 — Generate passwords (AI or fallback)
-    // ------------------------------------------------------------
-    let search_space = match run_python_ai(
-        &input_path,
-        length,
-        amount,
-        matches.get_one::<String>("algo").map(|s| s.as_str()),
-        matches
-            .get_one::<String>("threads")
-            .and_then(|v| v.parse().ok()),
-    ) {
+    let infinite_mode = matches.get_one::<String>("crack").is_some()
+        && matches.get_one::<String>("amount").is_none()
+        && matches.get_one::<String>("length").is_none();
+
+    let search_space = match run_python_ai(&input_path) {
         Ok(search_space) => search_space,
-        Err(e) => {
-            eprintln!(
-                "AI search-space generation failed: {e}\nFalling back to random Rust generator..."
-            );
-            let mut file = File::create(&output_path).expect("Failed to create output file");
-
-            for _ in 0..amount {
-                let password = generate_password(length);
-                writeln!(file, "{}", password).expect("Failed to write to file");
-            }
-
-            println!(
-                "Generated {} fallback passwords (len: {}) → {:?}",
-                amount, length, output_path
-            );
-
-            return;
+        Err(error) => {
+            eprintln!("Search-space generation failed: {error}");
+            std::process::exit(1);
         }
     };
 
-    let generated_candidates = expand_candidates(&search_space, length, amount);
-    let mut file = File::create(&output_path).expect("Failed to create output file");
-    for password in &generated_candidates {
-        writeln!(file, "{password}").expect("Failed to write to file");
-    }
-    println!(
-        "Generated {} candidates (len: {}) → {:?}",
-        generated_candidates.len(),
-        length,
-        output_path
-    );
-
-    // ------------------------------------------------------------
-    // STEP 2 — Hash Cracking Mode (Normal + Infinite Cracking)
-    // ------------------------------------------------------------
-    // ------------------------------------------------------------
     if let Some(hash_to_crack) = matches.get_one::<String>("crack") {
         let max_threads = matches
             .get_one::<String>("threads")
@@ -170,13 +139,18 @@ fn main() {
             .map(|s| s.as_str())
             .unwrap_or_else(|| {
                 let detected = detect_hash_algo(hash_to_crack);
+                if detected == "unsupported" {
+                    eprintln!("Unable to detect a supported hash algorithm; use --algo.");
+                    std::process::exit(2);
+                }
                 println!("Auto-detected hash type: {}", detected);
                 detected
             });
 
-        // Detect infinite mode (no amount/length supplied)
-        let infinite_mode = matches.get_one::<String>("amount").is_none()
-            && matches.get_one::<String>("length").is_none();
+        if !is_supported_algorithm(algo) {
+            eprintln!("Unsupported hash algorithm: {algo}");
+            std::process::exit(2);
+        }
 
         println!("\n=== Crack Mode Enabled ===");
         println!("→ Target Hash: {}", hash_to_crack);
@@ -187,25 +161,14 @@ fn main() {
         // NORMAL MODE (user specified amount or length)
         // --------------------------------------------------------
         if !infinite_mode {
-            let passwords = if matches.get_one::<String>("amount").is_some()
-                || matches.get_one::<String>("length").is_some()
-            {
+            let passwords = if let Some(length) = requested_length {
                 expand_candidates(&search_space, length, amount)
             } else {
-                match run_python_ai(
-                    &input_path,
-                    length,
-                    amount,
-                    matches.get_one::<String>("algo").map(|s| s.as_str()),
-                    max_threads,
-                ) {
-                    Ok(space) => expand_candidates(&space, length, amount),
-                    Err(e) => {
-                        eprintln!("AI search-space generation failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                let lengths = ranked_lengths(&search_space);
+                let mut excluded = HashSet::new();
+                expand_ranked_candidates(&search_space, &lengths, amount, &mut excluded)
             };
+            log_generated_passwords("Rust generated candidates", &passwords);
 
             let result =
                 crack_passwords_multithread(passwords, hash_to_crack.clone(), algo, max_threads);
@@ -229,32 +192,26 @@ fn main() {
         println!("→ No length/amount were provided.");
         println!("→ System will generate increasing batches until cracked.\n");
 
-        let mut length = 12; // starting length
         let mut batch_size = 100; // starting batch size
-        let max_length = 32; // safe upper bound
+        let lengths = ranked_lengths(&search_space);
+        let mut excluded = HashSet::new();
 
         loop {
             println!("---");
             println!("Batch attempt:");
             println!("→ Generating {} passwords", batch_size);
-            println!("→ Length {}", length);
+            println!("→ Ranked lengths: {:?}", lengths);
 
             // let temp_output = Path::new("output/infinite_run.txt");
 
-            // 1. Generate batch using AI
-            let passwords = match run_python_ai(
-                &input_path,
-                length,
-                batch_size,
-                matches.get_one::<String>("algo").map(|s| s.as_str()),
-                max_threads,
-            ) {
-                Ok(space) => expand_candidates(&space, length, batch_size),
-                Err(e) => {
-                    eprintln!("AI batch generation failed: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let passwords =
+                expand_ranked_candidates(&search_space, &lengths, batch_size, &mut excluded);
+
+            if passwords.is_empty() {
+                println!("Search space exhausted without a match.");
+                return;
+            }
+            log_generated_passwords("Rust generated batch", &passwords);
 
             // 3. Crack batch
             let result =
@@ -270,26 +227,36 @@ fn main() {
 
             println!("No match in this batch. Expanding search...\n");
 
-            // 4. Expand search space
-            if length < max_length {
-                length += 1; // go deeper
-            } else {
-                batch_size *= 2; // go wider
-            }
+            batch_size = batch_size.saturating_mul(2);
         }
     }
+
+    let generated_candidates = expand_candidates(&search_space, length, amount);
+    log_generated_passwords("Rust generated candidates", &generated_candidates);
+    let mut file = File::create(&output_path).expect("Failed to create output file");
+    for password in &generated_candidates {
+        writeln!(file, "{password}").expect("Failed to write to file");
+    }
+    println!(
+        "Generated {} candidates (len: {}) → {:?}",
+        generated_candidates.len(),
+        length,
+        output_path
+    );
+}
+
+fn log_generated_passwords(label: &str, passwords: &[String]) {
+    println!("\n=== {label} ({} total) ===", passwords.len());
+    for (index, password) in passwords.iter().enumerate() {
+        println!("{:>6}: {password}", index + 1);
+    }
+    println!("=== End {label} ===\n");
 }
 
 /// ------------------------------------------------------------
 /// PYTHON AI GENERATION
 /// ------------------------------------------------------------
-fn run_python_ai(
-    input_file: &Path,
-    length: usize,
-    amount: usize,
-    algo: Option<&str>, // NEW OPTIONAL FIELDS
-    threads: Option<usize>,
-) -> std::io::Result<SearchSpace> {
+fn run_python_ai(input_file: &Path) -> std::io::Result<SearchSpace> {
     #[cfg(target_os = "windows")]
     let venv_python = Path::new("venv").join("Scripts").join("python.exe");
 
@@ -317,30 +284,18 @@ fn run_python_ai(
 
     let mut cmd = ProcessCommand::new(&python_path);
 
-    cmd.arg("ai_logic/main.py")
-        .arg("--input")
-        .arg(input_file)
-        .arg("--length")
-        .arg(length.to_string())
-        .arg("--amount")
-        .arg(amount.to_string());
-
-    // optional parameters
-    if let Some(a) = algo {
-        cmd.arg("--algo").arg(a);
-    }
-
-    if let Some(t) = threads {
-        cmd.arg("--threads").arg(t.to_string());
-    }
+    cmd.arg("ai_logic/main.py").arg("--input").arg(input_file);
 
     let output = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output()?;
 
-    if !output.status.success() {
-        eprintln!(
-            "Python stderr:\n{}",
+    if !output.stderr.is_empty() {
+        eprint!(
+            "Python diagnostics:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    if !output.status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Python script failed",
@@ -358,26 +313,7 @@ fn run_python_ai(
     })?;
     search_space
         .validate()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-
-    Ok(search_space)
-}
-
-/// ------------------------------------------------------------
-/// FALLBACK GENERATOR
-/// ------------------------------------------------------------
-fn generate_password(length: usize) -> String {
-    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()";
-    // let mut rng = rand::rng();
-    let mut rng = thread_rng();
-
-    (0..length)
-        .map(|_| {
-            // let idx = rng.random_range(0..charset.len());
-            let idx = rng.gen_range(0..charset.len());
-            charset[idx] as char
-        })
-        .collect()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// ------------------------------------------------------------
@@ -405,6 +341,16 @@ fn generate_default_output_path(input_path: &Path) -> PathBuf {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
     let filename = format!("{}_{}.txt", stem.to_string_lossy(), timestamp);
     output_dir.join(filename)
+}
+
+fn ranked_lengths(search_space: &SearchSpace) -> Vec<usize> {
+    let mut lengths = search_space.likely_lengths.clone();
+    for length in 4..=32 {
+        if !lengths.contains(&length) {
+            lengths.push(length);
+        }
+    }
+    lengths
 }
 
 // fn load_passwords_from_output(output_file: &Path) -> Vec<String> {
