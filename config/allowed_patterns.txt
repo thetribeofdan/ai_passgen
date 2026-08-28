@@ -1,0 +1,24 @@
+# AI-PassGen bounded fallback patterns
+#
+# One complete non-symbol placeholder pattern per line. Blank lines and lines
+# beginning with '#' are ignored. Each entry must use the validated Rust
+# grammar: one or two token placeholders, at most one number/year placeholder,
+# and no more than five placeholders in total.
+#
+# Keep this file ordered: after all model-suggested patterns, Rust tries these
+# entries in this order before deriving one- and two-symbol mutations from
+# these base patterns.
+
+{token}
+{token}{number}
+{number}{token}
+{token}{year}
+{year}{token}
+{token1}{token2}
+{token}{token}
+{token1}{token2}{number}
+{token1}{number}{token2}
+{number}{token1}{token2}
+{token1}{token2}{year}
+{token1}{year}{token2}
+{year}{token1}{token2}

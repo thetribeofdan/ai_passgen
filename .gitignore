@@ -13,7 +13,6 @@ output/
 
 # Rust
 /target
-Cargo.lock
 
 # OS
 .DS_Store
