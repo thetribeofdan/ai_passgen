@@ -13,6 +13,8 @@ pub struct CrackResult {
     pub matched_password: Option<String>,
     pub matched_hash: Option<String>,
     pub time_taken: Duration,
+    pub rank: Option<usize>,
+    pub candidates_checked: usize,
 }
 
 /// Hashes a password using a "fast" digest (sha256/sha512/md5).
@@ -75,12 +77,15 @@ pub fn is_supported_algorithm(algo: &str) -> bool {
 /// - target_hash: the hash we want to crack
 /// - algo: which hash algorithm to use (sha256, bcrypt, argon2, etc.)
 /// - max_threads: optional override for Rayon threadpool size
-pub fn crack_passwords_multithread(
-    passwords: Vec<String>,
+pub fn crack_passwords_multithread<T>(
+    passwords: &[T],
     target_hash: String,
     algo: &str,
     max_threads: Option<usize>,
-) -> CrackResult {
+) -> CrackResult
+where
+    T: AsRef<str> + Sync,
+{
     let threads = max_threads.unwrap_or_else(num_cpus::get).max(1);
     let normalized_algo = algo.trim().to_ascii_lowercase();
     let normalized_hash = if matches!(normalized_algo.as_str(), "md5" | "sha256" | "sha512") {
@@ -96,16 +101,20 @@ pub fn crack_passwords_multithread(
 
     let start = Instant::now();
 
-    let found: Option<String> = pool.install(|| {
+    let candidate_count = passwords.len();
+    let found: Option<(usize, String)> = pool.install(|| {
         passwords
             .par_iter()
-            .find_any(|candidate| is_password_match(candidate, &normalized_hash, &normalized_algo))
-            .map(|s| s.to_string())
+            .enumerate()
+            .find_any(|(_, candidate)| {
+                is_password_match(candidate.as_ref(), &normalized_hash, &normalized_algo)
+            })
+            .map(|(index, candidate)| (index + 1, candidate.as_ref().to_string()))
     });
 
     let duration = start.elapsed();
 
-    if let Some(password) = found {
+    if let Some((rank, password)) = found {
         // For reporting: compute hash again for "fast" algorithms,
         // or just reuse target_hash for salted algorithms.
         let matched_hash = match normalized_algo.as_str() {
@@ -121,6 +130,8 @@ pub fn crack_passwords_multithread(
             matched_password: Some(password),
             matched_hash: Some(matched_hash),
             time_taken: duration,
+            rank: Some(rank),
+            candidates_checked: candidate_count,
         }
     } else {
         CrackResult {
@@ -128,6 +139,8 @@ pub fn crack_passwords_multithread(
             matched_password: None,
             matched_hash: None,
             time_taken: duration,
+            rank: None,
+            candidates_checked: candidate_count,
         }
     }
 }
@@ -138,8 +151,9 @@ mod tests {
 
     #[test]
     fn verifies_md5_and_normalizes_inputs() {
+        let candidates = vec!["wrong".to_string(), "secret".to_string()];
         let result = crack_passwords_multithread(
-            vec!["wrong".to_string(), "secret".to_string()],
+            &candidates,
             "5EBE2294ECD0E0F08EAB7690D2A6EE69".to_string(),
             " MD5 ",
             Some(0),

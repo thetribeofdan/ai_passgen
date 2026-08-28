@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from generator import generate_search_space
+from generator import generate_search_space_with_model_output
 
 
 def load_persona(
@@ -41,10 +41,13 @@ def load_persona(
 
 
 def write_json_stdout(
-    value: dict[str, Any],
+    persona_json: dict[str, Any],
+    search_space: dict[str, Any],
+    llm_raw_output: str,
+    llm_model_id: str,
 ) -> None:
     """
-    Write exactly one JSON object to stdout.
+    Write exactly one model-generation record to stdout.
 
     Rust consumes stdout as the machine-readable interface,
     so diagnostics must never be written here.
@@ -52,7 +55,12 @@ def write_json_stdout(
 
     sys.stdout.write(
         json.dumps(
-            value,
+            {
+                "persona_json": persona_json,
+                "search_space": search_space,
+                "llm_raw_output": llm_raw_output,
+                "llm_model_id": llm_model_id,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -83,12 +91,15 @@ def main() -> int:
             args.input
         )
 
-        search_space = generate_search_space(
+        search_space, llm_raw_output, llm_model_id = generate_search_space_with_model_output(
             persona
         )
 
         write_json_stdout(
-            search_space
+            persona,
+            search_space,
+            llm_raw_output,
+            llm_model_id,
         )
 
         return 0

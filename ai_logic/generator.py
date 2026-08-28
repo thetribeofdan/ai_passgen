@@ -1,7 +1,7 @@
 import json
 import os
 import re
-import sys
+import string
 from pathlib import Path
 from typing import Any
 
@@ -26,15 +26,19 @@ SEARCH_SPACE_FIELDS = (
 )
 
 
-ALLOWED_PATTERNS = {
-    "{token}{year}",
-    "{token}{number}",
-    "{token}{symbol}{number}",
-    "{token1}{token2}{number}",
-    "{token}{symbol}{token}{year}",
-    "{token}{number}{symbol}",
-    "{token}{symbol}{year}",
+ALLOWED_PLACEHOLDERS = {
+    "token",
+    "token1",
+    "token2",
+    "number",
+    "year",
+    "symbol",
 }
+
+MAX_TOKEN_PLACEHOLDERS = 2
+MAX_NUMERIC_PLACEHOLDERS = 1
+MAX_SYMBOL_PLACEHOLDERS = 2
+MAX_PATTERN_PLACEHOLDERS = 5
 
 
 SYSTEM_PROMPT = """
@@ -74,6 +78,15 @@ Rules:
    {symbol}
 6. Keep the search space compact and relevant.
 7. Use an empty array when a category has no relevant values.
+8. For broad categories such as NATO phonetic alphabet, include only the
+concepts directly supported by the persona.
+9. Patterns are ranking hints only: Rust will deterministically enumerate its
+own fallback templates and one- and two-symbol mutations after every model
+pattern.
+10. A pattern must contain one or two token placeholders, at most one of
+{number}/{year}, at most two {symbol} placeholders, and no literal text.
+When {symbol} appears twice, each occurrence is an independently selected
+symbol value.
 """.strip()
 
 
@@ -128,15 +141,24 @@ def build_prompt(
     )
 
 
-def generate_search_space(
+def configured_model_id() -> str:
+    """Return the model identifier recorded with each research run."""
+
+    return os.getenv(
+        "HF_MODEL_ID",
+        DEFAULT_MODEL,
+    )
+
+
+def generate_search_space_with_model_output(
     persona: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str, str]:
     """
-    Query the dedicated Hugging Face endpoint and return a
-    validated SearchSpace object.
+    Query the dedicated Hugging Face endpoint and return the validated
+    SearchSpace, raw model response, and configured model identifier.
     """
 
-    raw_response = request_huggingface(
+    raw_response, model_id = request_huggingface(
         persona
     )
 
@@ -150,14 +172,30 @@ def generate_search_space(
             "SearchSpace JSON object."
         )
 
-    return validate_search_space(
-        parsed
+    return (
+        validate_search_space(
+            parsed
+        ),
+        raw_response,
+        model_id,
     )
+
+
+def generate_search_space(
+    persona: dict[str, Any],
+) -> dict[str, Any]:
+    """Return only the validated SearchSpace for callers that do not log runs."""
+
+    search_space, _, _ = generate_search_space_with_model_output(
+        persona
+    )
+
+    return search_space
 
 
 def request_huggingface(
     persona: dict[str, Any],
-) -> str:
+) -> tuple[str, str]:
     """
     Send the persona to the GPT-OSS endpoint.
 
@@ -167,10 +205,7 @@ def request_huggingface(
 
     client = create_client()
 
-    model = os.getenv(
-        "HF_MODEL_ID",
-        DEFAULT_MODEL,
-    )
+    model = configured_model_id()
 
     prompt = build_prompt(
         persona
@@ -189,7 +224,7 @@ def request_huggingface(
             },
         ],
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=4096,
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -269,11 +304,7 @@ def request_huggingface(
             "Hugging Face endpoint returned no text content."
         )
 
-    print("[Hugging Face model response]", file=sys.stderr)
-    print(content, file=sys.stderr)
-    print("[End Hugging Face model response]", file=sys.stderr)
-
-    return content
+    return content, model
 
 
 def extract_json(
@@ -349,19 +380,14 @@ def validate_search_space(
     result["preferred_symbols"] = [
         symbol
         for symbol in result["preferred_symbols"]
-        if len(symbol) == 1
+        if len(symbol) == 1 and symbol in string.punctuation
     ]
 
     result["likely_patterns"] = [
         pattern
         for pattern in result["likely_patterns"]
-        if pattern in ALLOWED_PATTERNS
+        if is_valid_pattern(pattern)
     ]
-
-    if not result["likely_patterns"]:
-        raise ValueError(
-            "SearchSpace contains no supported patterns."
-        )
 
     lengths = value.get("likely_lengths", [])
     if not isinstance(lengths, list) or not all(
@@ -376,9 +402,41 @@ def validate_search_space(
     result["pattern_weights"] = {
         pattern: weight
         for pattern, weight in weights.items()
-        if pattern in ALLOWED_PATTERNS
+        if pattern in result["likely_patterns"]
         and isinstance(weight, (int, float))
         and 0 <= weight <= 1
     }
 
     return result
+
+
+def is_valid_pattern(pattern: str) -> bool:
+    """Validate the bounded placeholder grammar owned by Rust."""
+    if not isinstance(pattern, str) or "{" not in pattern:
+        return False
+    placeholders = re.findall(r"\{([^{}]+)\}", pattern)
+    if (
+        not placeholders
+        or "".join(f"{{{placeholder}}}" for placeholder in placeholders)
+        != pattern
+        or any(
+            placeholder not in ALLOWED_PLACEHOLDERS
+            for placeholder in placeholders
+        )
+    ):
+        return False
+    token_count = sum(
+        placeholder.startswith("token")
+        for placeholder in placeholders
+    )
+    numeric_count = sum(
+        placeholder in {"number", "year"}
+        for placeholder in placeholders
+    )
+    symbol_count = placeholders.count("symbol")
+    return (
+        1 <= token_count <= MAX_TOKEN_PLACEHOLDERS
+        and numeric_count <= MAX_NUMERIC_PLACEHOLDERS
+        and symbol_count <= MAX_SYMBOL_PLACEHOLDERS
+        and len(placeholders) <= MAX_PATTERN_PLACEHOLDERS
+    )
