@@ -1,24 +1,19 @@
 # AI-PassGen bounded fallback patterns
 #
-# One complete non-symbol placeholder pattern per line. Blank lines and lines
-# beginning with '#' are ignored. Each entry must use the validated Rust
-# grammar: one or two token placeholders, at most one number/year placeholder,
-# and no more than five placeholders in total.
+# One complete non-symbol pattern or fallback macro per line. Blank lines and
+# lines beginning with '#' are ignored. Explicit patterns use indexed token
+# placeholders (`{token1}` ... `{tokenN}`), at most one `{number}`/`{year}`,
+# and no more than two Rust-derived `{symbol}` placeholders.
 #
 # Keep this file ordered: after all model-suggested patterns, Rust tries these
 # entries in this order before deriving one- and two-symbol mutations from
 # these base patterns.
+#
+# `{token_sequence}` expands to every ordered token arity from one through the
+# selected `--max-token-slots` value, after length-aware feasibility ordering.
+# `{token_sequence_with_number}` also inserts one `{number}` at every token
+# boundary. `{year}` is intentionally not duplicated here because it draws
+# from the same numeric value stream as `{number}`.
 
-{token}
-{token}{number}
-{number}{token}
-{token}{year}
-{year}{token}
-{token1}{token2}
-{token}{token}
-{token1}{token2}{number}
-{token1}{number}{token2}
-{number}{token1}{token2}
-{token1}{token2}{year}
-{token1}{year}{token2}
-{year}{token1}{token2}
+{token_sequence}
+{token_sequence_with_number}

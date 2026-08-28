@@ -18,7 +18,10 @@ use crate::expander::{
     GeneratedCandidate, expand_candidates, expand_candidates_with_provenance,
     expand_ranked_candidates_with_provenance,
 };
-use crate::search_space::{AllowedPatterns, SearchSpace, default_allowed_patterns_path};
+use crate::search_space::{
+    AllowedPatterns, DEFAULT_MAX_TOKEN_SLOTS, MAX_TOKEN_SLOTS, SearchSpace,
+    default_allowed_patterns_path, validate_max_token_slots,
+};
 use crate::telemetry::{CrackRunRecord, CrackedPasswordPattern, seconds, throughput};
 
 #[derive(Debug, serde::Deserialize)]
@@ -28,6 +31,40 @@ struct GenerationContext {
     llm_model_id: String,
     llm_raw_output: String,
     search_space: SearchSpace,
+}
+
+struct AggregateVerificationMetrics {
+    candidates_generated: usize,
+    actual_candidates_evaluated: usize,
+    configured_threads: usize,
+    peak_active_worker_threads: usize,
+}
+
+impl AggregateVerificationMetrics {
+    fn new(configured_threads: usize) -> Self {
+        Self {
+            candidates_generated: 0,
+            actual_candidates_evaluated: 0,
+            configured_threads,
+            peak_active_worker_threads: 0,
+        }
+    }
+
+    fn record_batch(
+        &mut self,
+        candidates_generated: usize,
+        actual_candidates_evaluated: usize,
+        active_worker_threads: usize,
+    ) {
+        self.candidates_generated = self
+            .candidates_generated
+            .saturating_add(candidates_generated);
+        self.actual_candidates_evaluated = self
+            .actual_candidates_evaluated
+            .saturating_add(actual_candidates_evaluated);
+        self.peak_active_worker_threads =
+            self.peak_active_worker_threads.max(active_worker_threads);
+    }
 }
 
 /// ------------------------------------------------------------
@@ -67,7 +104,7 @@ fn main() {
                 .short('a')
                 .long("amount")
                 .value_name("AMOUNT")
-                .help("Number of passwords to generate (default: 20)")
+                .help("Number of passwords to generate (default: 2000 outside crack mode)")
                 .num_args(1),
         )
         .arg(
@@ -77,6 +114,13 @@ fn main() {
                 .help(
                     "Validated non-symbol fallback pattern file (default: config/allowed_patterns.txt)",
                 )
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("max-token-slots")
+                .long("max-token-slots")
+                .value_name("N")
+                .help("Maximum indexed token slots per pattern (default: 6; maximum: 32)")
                 .num_args(1),
         )
         .arg(
@@ -132,11 +176,10 @@ fn main() {
         )
         .get_matches();
 
-    // Resolve input file
     let input_path = matches
         .get_one::<String>("input")
         .map(PathBuf::from)
-        .unwrap_or_else(|| get_default_persona_file());
+        .unwrap_or_else(get_default_persona_file);
 
     if matches.get_one::<String>("crack").is_some() && matches.get_one::<String>("input").is_none()
     {
@@ -149,11 +192,29 @@ fn main() {
         std::process::exit(1);
     }
 
+    let max_token_slots = match matches.get_one::<String>("max-token-slots") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("--max-token-slots must be an integer between 1 and {MAX_TOKEN_SLOTS}.");
+                std::process::exit(2);
+            }
+        },
+        None => DEFAULT_MAX_TOKEN_SLOTS,
+    };
+    if let Err(error) = validate_max_token_slots(max_token_slots) {
+        eprintln!("Invalid --max-token-slots value: {error}.");
+        std::process::exit(2);
+    }
+
     let allowed_patterns_path = matches
         .get_one::<String>("allowed-patterns")
         .map(PathBuf::from)
         .unwrap_or_else(default_allowed_patterns_path);
-    let allowed_patterns = match AllowedPatterns::from_file(&allowed_patterns_path) {
+    let allowed_patterns = match AllowedPatterns::from_file_with_max_token_slots(
+        &allowed_patterns_path,
+        max_token_slots,
+    ) {
         Ok(patterns) => patterns,
         Err(error) => {
             eprintln!("Allowed-patterns configuration failed: {error}");
@@ -161,9 +222,10 @@ fn main() {
         }
     };
     println!(
-        "Loaded {} allowed fallback patterns from {:?}",
+        "Loaded {} allowed fallback entries from {:?} (up to {} token slots)",
         allowed_patterns.len(),
-        allowed_patterns_path
+        allowed_patterns_path,
+        max_token_slots,
     );
 
     // Resolve output path
@@ -199,6 +261,20 @@ fn main() {
 
     let infinite_mode = matches.get_one::<String>("crack").is_some()
         && matches.get_one::<String>("amount").is_none();
+    let configured_threads = if matches.get_one::<String>("crack").is_some() {
+        Some(match matches.get_one::<String>("threads") {
+            Some(value) => match value.parse::<usize>() {
+                Ok(value) if value > 0 => value,
+                _ => {
+                    eprintln!("--threads must be a positive integer.");
+                    std::process::exit(2);
+                }
+            },
+            None => num_cpus::get().max(1),
+        })
+    } else {
+        None
+    };
 
     let generation_started = Instant::now();
     let GenerationContext {
@@ -206,7 +282,7 @@ fn main() {
         llm_model_id,
         llm_raw_output,
         search_space,
-    } = match run_python_ai(&input_path) {
+    } = match run_python_ai(&input_path, max_token_slots) {
         Ok(context) => context,
         Err(error) => {
             eprintln!("Search-space generation failed: {error}");
@@ -215,9 +291,8 @@ fn main() {
     };
 
     if let Some(hash_to_crack) = matches.get_one::<String>("crack") {
-        let max_threads = matches
-            .get_one::<String>("threads")
-            .and_then(|v| v.parse::<usize>().ok());
+        let configured_threads =
+            configured_threads.expect("crack mode resolves a positive configured thread count");
 
         // Algorithm: CLI override, otherwise auto-detect.
         let algo = matches
@@ -241,7 +316,7 @@ fn main() {
         println!("\n=== Crack Mode Enabled ===");
         println!("→ Target Hash: {}", hash_to_crack);
         println!("→ Algorithm: {}", algo);
-        println!("→ Threads: {}\n", max_threads.unwrap_or_else(num_cpus::get));
+        println!("→ Configured verifier threads: {}\n", configured_threads);
 
         // --------------------------------------------------------
         // NORMAL MODE (user specified amount or length)
@@ -261,10 +336,17 @@ fn main() {
                 )
             };
             let generation_time = generation_started.elapsed();
-            let result =
-                crack_passwords_multithread(&candidates, hash_to_crack.clone(), algo, max_threads);
+            let result = crack_passwords_multithread(
+                &candidates,
+                hash_to_crack.clone(),
+                algo,
+                Some(configured_threads),
+            );
             let total_runtime = generation_started.elapsed();
             let cracked_password_pattern = cracked_password_pattern(result.rank, &candidates);
+            let matched_search_phase = cracked_password_pattern
+                .as_ref()
+                .map(|pattern| pattern.source_phase.clone());
 
             if result.cracked {
                 println!("MATCH FOUND!");
@@ -279,7 +361,6 @@ fn main() {
             }
 
             println!("Time taken: {:?}", result.time_taken);
-            let threads = max_threads.unwrap_or_else(num_cpus::get).max(1);
             let record = CrackRunRecord {
                 run_id: create_id("run"),
                 condition: matches
@@ -302,17 +383,26 @@ fn main() {
                 llm_model_id: llm_model_id.clone(),
                 llm_raw_output: llm_raw_output.clone(),
                 validated_search_space: search_space.clone(),
-                search_space_size: result.candidates_checked,
+                search_space_size: result.candidates_submitted,
+                candidates_generated: result.candidates_submitted,
+                actual_candidates_evaluated: result.candidates_evaluated,
                 cracked: result.cracked,
                 rank: result.rank,
                 cracked_password_pattern,
+                matched_search_phase,
                 time_to_first_match_seconds: result.cracked.then(|| seconds(total_runtime)),
                 total_runtime_seconds: seconds(total_runtime),
                 generation_time_seconds: seconds(generation_time),
                 verification_time_seconds: seconds(result.time_taken),
-                threads_utilization: threads as f64 / num_cpus::get().max(1) as f64,
-                candidate_throughput: throughput(result.candidates_checked, result.time_taken),
-                generation_throughput: throughput(result.candidates_checked, generation_time),
+                configured_threads: result.configured_threads,
+                active_worker_threads: result.active_worker_threads,
+                available_logical_cpus: num_cpus::get().max(1),
+                threads_utilization: thread_utilization(
+                    result.active_worker_threads,
+                    result.configured_threads,
+                ),
+                candidate_throughput: throughput(result.candidates_evaluated, result.time_taken),
+                generation_throughput: throughput(result.candidates_submitted, generation_time),
                 observed_password_length: matches
                     .get_one::<String>("observed-length")
                     .and_then(|value| value.parse().ok()),
@@ -348,7 +438,7 @@ fn main() {
             .map(|length| vec![length])
             .unwrap_or_else(|| ranked_lengths(&search_space));
         let mut excluded = HashSet::new();
-        let mut total_candidates = 0;
+        let mut verification_metrics = AggregateVerificationMetrics::new(configured_threads);
         let mut total_verification_time = std::time::Duration::ZERO;
 
         loop {
@@ -370,7 +460,7 @@ fn main() {
                     &llm_model_id,
                     &llm_raw_output,
                     &search_space,
-                    total_candidates,
+                    verification_metrics,
                     false,
                     None,
                     None,
@@ -379,12 +469,20 @@ fn main() {
                 );
                 return;
             }
-            total_candidates += candidates.len();
             let batch_len = candidates.len();
 
             // 3. Crack batch
-            let result =
-                crack_passwords_multithread(&candidates, hash_to_crack.clone(), algo, max_threads);
+            let result = crack_passwords_multithread(
+                &candidates,
+                hash_to_crack.clone(),
+                algo,
+                Some(configured_threads),
+            );
+            verification_metrics.record_batch(
+                result.candidates_submitted,
+                result.candidates_evaluated,
+                result.active_worker_threads,
+            );
             total_verification_time += result.time_taken;
 
             if result.cracked {
@@ -397,6 +495,9 @@ fn main() {
                 }
                 println!("Time Taken: {:?}", result.time_taken);
                 let cracked_password_pattern = cracked_password_pattern(result.rank, &candidates);
+                let global_rank = result
+                    .rank
+                    .map(|rank| verification_metrics.candidates_generated - batch_len + rank);
                 write_infinite_run_record(
                     &matches,
                     hash_to_crack,
@@ -405,9 +506,9 @@ fn main() {
                     &llm_model_id,
                     &llm_raw_output,
                     &search_space,
-                    total_candidates,
+                    verification_metrics,
                     true,
-                    result.rank.map(|rank| total_candidates - batch_len + rank),
+                    global_rank,
                     cracked_password_pattern,
                     generation_started,
                     total_verification_time,
@@ -453,20 +554,18 @@ fn write_infinite_run_record(
     llm_model_id: &str,
     llm_raw_output: &str,
     validated_search_space: &SearchSpace,
-    search_space_size: usize,
+    metrics: AggregateVerificationMetrics,
     cracked: bool,
     batch_rank: Option<usize>,
     cracked_password_pattern: Option<CrackedPasswordPattern>,
     run_started: Instant,
     verification_time: std::time::Duration,
 ) {
-    let threads = matches
-        .get_one::<String>("threads")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(num_cpus::get)
-        .max(1);
     let total_runtime = run_started.elapsed();
     let generation_time = total_runtime.saturating_sub(verification_time);
+    let matched_search_phase = cracked_password_pattern
+        .as_ref()
+        .map(|pattern| pattern.source_phase.clone());
     let record = CrackRunRecord {
         run_id: create_id("run"),
         condition: matches
@@ -483,17 +582,26 @@ fn write_infinite_run_record(
         llm_model_id: llm_model_id.to_string(),
         llm_raw_output: llm_raw_output.to_string(),
         validated_search_space: validated_search_space.clone(),
-        search_space_size,
+        search_space_size: metrics.candidates_generated,
+        candidates_generated: metrics.candidates_generated,
+        actual_candidates_evaluated: metrics.actual_candidates_evaluated,
         cracked,
         rank: batch_rank,
         cracked_password_pattern,
+        matched_search_phase,
         time_to_first_match_seconds: cracked.then(|| seconds(total_runtime)),
         total_runtime_seconds: seconds(total_runtime),
         generation_time_seconds: seconds(generation_time),
         verification_time_seconds: seconds(verification_time),
-        threads_utilization: threads as f64 / num_cpus::get().max(1) as f64,
-        candidate_throughput: throughput(search_space_size, verification_time),
-        generation_throughput: throughput(search_space_size, generation_time),
+        configured_threads: metrics.configured_threads,
+        active_worker_threads: metrics.peak_active_worker_threads,
+        available_logical_cpus: num_cpus::get().max(1),
+        threads_utilization: thread_utilization(
+            metrics.peak_active_worker_threads,
+            metrics.configured_threads,
+        ),
+        candidate_throughput: throughput(metrics.actual_candidates_evaluated, verification_time),
+        generation_throughput: throughput(metrics.candidates_generated, generation_time),
         observed_password_length: matches
             .get_one::<String>("observed-length")
             .and_then(|value| value.parse().ok()),
@@ -513,7 +621,7 @@ fn write_infinite_run_record(
 /// ------------------------------------------------------------
 /// PYTHON AI GENERATION
 /// ------------------------------------------------------------
-fn run_python_ai(input_file: &Path) -> std::io::Result<GenerationContext> {
+fn run_python_ai(input_file: &Path, max_token_slots: usize) -> std::io::Result<GenerationContext> {
     #[cfg(target_os = "windows")]
     let venv_python = Path::new("venv").join("Scripts").join("python.exe");
 
@@ -541,7 +649,11 @@ fn run_python_ai(input_file: &Path) -> std::io::Result<GenerationContext> {
 
     let mut cmd = ProcessCommand::new(&python_path);
 
-    cmd.arg("ai_logic/main.py").arg("--input").arg(input_file);
+    cmd.arg("ai_logic/main.py")
+        .arg("--input")
+        .arg(input_file)
+        .arg("--max-token-slots")
+        .arg(max_token_slots.to_string());
 
     let output = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output()?;
 
@@ -559,10 +671,13 @@ fn run_python_ai(input_file: &Path) -> std::io::Result<GenerationContext> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_generation_context(stdout.trim())
+    parse_generation_context(stdout.trim(), max_token_slots)
 }
 
-fn parse_generation_context(stdout: &str) -> std::io::Result<GenerationContext> {
+fn parse_generation_context(
+    stdout: &str,
+    max_token_slots: usize,
+) -> std::io::Result<GenerationContext> {
     let GenerationContext {
         persona_json,
         llm_model_id,
@@ -587,7 +702,7 @@ fn parse_generation_context(stdout: &str) -> std::io::Result<GenerationContext> 
         ));
     }
     let search_space = search_space
-        .validate()
+        .validate_with_max_token_slots(max_token_slots)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
     Ok(GenerationContext {
@@ -631,6 +746,14 @@ fn create_id(prefix: &str) -> String {
     id
 }
 
+fn thread_utilization(active_worker_threads: usize, configured_threads: usize) -> f64 {
+    if configured_threads == 0 {
+        0.0
+    } else {
+        active_worker_threads as f64 / configured_threads as f64
+    }
+}
+
 fn ranked_lengths(search_space: &SearchSpace) -> Vec<usize> {
     let mut lengths = Vec::new();
     for length in search_space
@@ -655,7 +778,10 @@ fn ranked_lengths(search_space: &SearchSpace) -> Vec<usize> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{cracked_password_pattern, parse_generation_context, ranked_lengths};
+    use super::{
+        AggregateVerificationMetrics, DEFAULT_MAX_TOKEN_SLOTS, cracked_password_pattern,
+        parse_generation_context, ranked_lengths, thread_utilization,
+    };
     use crate::expander::GeneratedCandidate;
     use crate::search_space::SearchSpace;
 
@@ -695,6 +821,7 @@ mod tests {
                     "pattern_weights": {"{token}{number}": 0.9}
                 }
             }"#,
+            DEFAULT_MAX_TOKEN_SLOTS,
         )
         .unwrap();
 
@@ -702,6 +829,27 @@ mod tests {
         assert_eq!(context.llm_model_id, "test-model");
         assert_eq!(context.llm_raw_output, "raw model output");
         assert_eq!(context.search_space.primary_tokens, vec!["Dan"]);
+    }
+
+    #[test]
+    fn model_generation_envelope_honors_the_selected_token_slot_cap() {
+        let envelope = r#"{
+            "persona_json": {"persona": {"name": "Dan"}},
+            "llm_model_id": "test-model",
+            "llm_raw_output": "raw model output",
+            "search_space": {
+                "primary_tokens": ["A", "B", "C"],
+                "secondary_tokens": [],
+                "important_numbers": [],
+                "preferred_symbols": [],
+                "likely_patterns": ["{token1}{token2}{token3}"],
+                "likely_lengths": [4],
+                "pattern_weights": {}
+            }
+        }"#;
+
+        assert!(parse_generation_context(envelope, 3).is_ok());
+        assert!(parse_generation_context(envelope, 2).is_err());
     }
 
     #[test]
@@ -719,6 +867,25 @@ mod tests {
         assert_eq!(pattern.source_phase, "weighted_model");
         assert_eq!(pattern.case_variant, "original");
         assert!(cracked_password_pattern(Some(2), &candidates).is_none());
+    }
+
+    #[test]
+    fn reports_active_workers_as_a_fraction_of_configured_workers() {
+        assert_eq!(thread_utilization(0, 4), 0.0);
+        assert_eq!(thread_utilization(3, 4), 0.75);
+        assert_eq!(thread_utilization(1, 0), 0.0);
+    }
+
+    #[test]
+    fn aggregates_generated_and_evaluated_work_independently_across_batches() {
+        let mut metrics = AggregateVerificationMetrics::new(4);
+        metrics.record_batch(100, 100, 3);
+        metrics.record_batch(200, 17, 2);
+
+        assert_eq!(metrics.candidates_generated, 300);
+        assert_eq!(metrics.actual_candidates_evaluated, 117);
+        assert_eq!(metrics.configured_threads, 4);
+        assert_eq!(metrics.peak_active_worker_threads, 3);
     }
 }
 

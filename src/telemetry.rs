@@ -25,14 +25,28 @@ pub struct CrackRunRecord {
     pub llm_model_id: String,
     pub llm_raw_output: String,
     pub validated_search_space: SearchSpace,
+    /// Legacy generated/submitted candidate count. Retained for compatibility.
     pub search_space_size: usize,
+    /// Explicit generated/submitted candidate count for this full run.
+    pub candidates_generated: usize,
+    /// Exact number of hash-verification calls that started during this run.
+    pub actual_candidates_evaluated: usize,
     pub cracked: bool,
     pub rank: Option<usize>,
     pub cracked_password_pattern: Option<CrackedPasswordPattern>,
+    /// Top-level analysis-friendly copy of `cracked_password_pattern.source_phase`.
+    pub matched_search_phase: Option<String>,
     pub time_to_first_match_seconds: Option<f64>,
     pub total_runtime_seconds: f64,
     pub generation_time_seconds: f64,
     pub verification_time_seconds: f64,
+    /// Number of Rayon workers configured for a verifier batch.
+    pub configured_threads: usize,
+    /// Peak number of configured Rayon workers that evaluated a candidate in
+    /// any verifier batch. In finite mode there is exactly one batch.
+    pub active_worker_threads: usize,
+    pub available_logical_cpus: usize,
+    /// `active_worker_threads / configured_threads`, not host CPU usage.
     pub threads_utilization: f64,
     pub candidate_throughput: f64,
     pub generation_throughput: f64,
@@ -91,6 +105,8 @@ mod tests {
                 pattern_weights: Default::default(),
             },
             search_space_size: 10,
+            candidates_generated: 10,
+            actual_candidates_evaluated: 7,
             cracked: true,
             rank: Some(1),
             cracked_password_pattern: Some(CrackedPasswordPattern {
@@ -98,11 +114,15 @@ mod tests {
                 source_phase: "weighted_model".to_string(),
                 case_variant: "original".to_string(),
             }),
+            matched_search_phase: Some("weighted_model".to_string()),
             time_to_first_match_seconds: Some(1.0),
             total_runtime_seconds: 1.0,
             generation_time_seconds: 0.5,
             verification_time_seconds: 0.5,
-            threads_utilization: 1.0,
+            configured_threads: 4,
+            active_worker_threads: 3,
+            available_logical_cpus: 8,
+            threads_utilization: 0.75,
             candidate_throughput: 20.0,
             generation_throughput: 20.0,
             observed_password_length: None,
@@ -117,6 +137,12 @@ mod tests {
         assert_eq!(json["llm_model_id"], "test-model");
         assert_eq!(json["llm_raw_output"], "{\"primary_tokens\":[\"Dan\"]}");
         assert_eq!(json["validated_search_space"]["primary_tokens"][0], "Dan");
+        assert_eq!(json["candidates_generated"], 10);
+        assert_eq!(json["actual_candidates_evaluated"], 7);
+        assert_eq!(json["matched_search_phase"], "weighted_model");
+        assert_eq!(json["configured_threads"], 4);
+        assert_eq!(json["active_worker_threads"], 3);
+        assert_eq!(json["threads_utilization"], 0.75);
         assert_eq!(
             json["cracked_password_pattern"]["source_pattern"],
             "{token}"
@@ -130,10 +156,12 @@ mod tests {
         record.cracked = false;
         record.rank = None;
         record.cracked_password_pattern = None;
+        record.matched_search_phase = None;
         record.time_to_first_match_seconds = None;
         let exhausted_json = serde_json::to_value(record).unwrap();
         assert!(exhausted_json["rank"].is_null());
         assert!(exhausted_json["cracked_password_pattern"].is_null());
+        assert!(exhausted_json["matched_search_phase"].is_null());
         assert!(exhausted_json["time_to_first_match_seconds"].is_null());
     }
 }

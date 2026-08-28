@@ -4,7 +4,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from generator import generate_search_space_with_model_output
+from generator import (
+    DEFAULT_MAX_TOKEN_SLOTS,
+    MAX_TOKEN_SLOTS,
+    generate_search_space_with_model_output,
+)
 
 
 def load_persona(
@@ -84,7 +88,23 @@ def main() -> int:
         help="Path to the persona JSON file.",
     )
 
+    parser.add_argument(
+        "--max-token-slots",
+        type=int,
+        default=DEFAULT_MAX_TOKEN_SLOTS,
+        help=(
+            "Maximum indexed token slots allowed in a pattern "
+            f"(1-{MAX_TOKEN_SLOTS}; default: "
+            f"{DEFAULT_MAX_TOKEN_SLOTS})."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if not 1 <= args.max_token_slots <= MAX_TOKEN_SLOTS:
+        parser.error(
+            f"--max-token-slots must be between 1 and {MAX_TOKEN_SLOTS}."
+        )
 
     try:
         persona = load_persona(
@@ -92,7 +112,8 @@ def main() -> int:
         )
 
         search_space, llm_raw_output, llm_model_id = generate_search_space_with_model_output(
-            persona
+            persona,
+            args.max_token_slots,
         )
 
         write_json_stdout(

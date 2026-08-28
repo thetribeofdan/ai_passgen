@@ -1,16 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde::Serialize;
 
 use crate::search_space::{
-    AllowedPatterns, SearchSpace, is_valid_pattern, rust_derived_symbol_mutations,
-    rust_derived_two_symbol_mutations, rust_numbers, rust_symbols,
+    AllowedPatterns, SearchSpace, is_valid_pattern_with_max_token_slots,
+    rust_derived_symbol_mutations, rust_derived_two_symbol_mutations, rust_numbers, rust_symbols,
+    token_slot_index,
 };
 
-const PATTERN_PHASE_NAMES: [&str; 5] = [
+const PATTERN_PHASE_NAMES: [&str; 6] = [
     "weighted_model",
     "unweighted_model",
     "configured_fallback",
+    "generated_fallback",
     "rust_derived_one_symbol",
     "rust_derived_two_symbol",
 ];
@@ -100,26 +102,28 @@ pub fn expand_ranked_candidates_with_provenance(
     let symbols = expansion_symbols(search_space);
     let empty_values = vec![String::new()];
     let mut candidates = Vec::with_capacity(amount.min(1024));
+    let fallback_token_arities = prioritized_token_arities(
+        &tokens,
+        &numbers,
+        &symbols,
+        lengths,
+        allowed_patterns.max_token_slots(),
+    );
 
     // The phase loop is intentionally outside the length loop. A fallback
     // candidate at a shorter length must never preempt a model pattern at a
     // later length.
-    for (phase_index, patterns) in pattern_phases(search_space, allowed_patterns)
-        .into_iter()
-        .enumerate()
+    for (phase_index, patterns) in
+        pattern_phases(search_space, allowed_patterns, &fallback_token_arities)
+            .into_iter()
+            .enumerate()
     {
         let source_phase = PATTERN_PHASE_NAMES[phase_index];
         for pattern in patterns {
-            let first_values = if pattern.contains("{token}") || pattern.contains("{token1}") {
-                &tokens
-            } else {
-                &empty_values
-            };
-            let second_values = if pattern.contains("{token2}") {
-                &tokens
-            } else {
-                &empty_values
-            };
+            let token_slots = pattern_token_slots(&pattern);
+            if token_slots.is_empty() {
+                continue;
+            }
             let number_values = if pattern.contains("{number}") || pattern.contains("{year}") {
                 &numbers
             } else {
@@ -146,33 +150,23 @@ pub fn expand_ranked_candidates_with_provenance(
                 for first_symbol in first_symbol_values {
                     for second_symbol in second_symbol_values {
                         for &length in lengths {
-                            for first in first_values {
-                                for second in second_values {
-                                    let candidate = render_candidate(
-                                        &pattern,
-                                        first,
-                                        second,
-                                        number,
-                                        first_symbol,
-                                        second_symbol,
-                                    );
-
-                                    for (case_variant, variant) in case_variants(&candidate) {
-                                        if variant.chars().count() == length
-                                            && excluded.insert(variant.clone())
-                                        {
-                                            candidates.push(GeneratedCandidate {
-                                                password: variant,
-                                                source_pattern: pattern.clone(),
-                                                source_phase: source_phase.to_string(),
-                                                case_variant: case_variant.to_string(),
-                                            });
-                                            if candidates.len() == amount {
-                                                return candidates;
-                                            }
-                                        }
-                                    }
-                                }
+                            let mut token_indices = Vec::with_capacity(token_slots.len());
+                            if append_token_assignments(
+                                0,
+                                &token_slots,
+                                &tokens,
+                                &mut token_indices,
+                                &pattern,
+                                number,
+                                first_symbol,
+                                second_symbol,
+                                length,
+                                excluded,
+                                &mut candidates,
+                                amount,
+                                source_phase,
+                            ) {
+                                return candidates;
                             }
                         }
                     }
@@ -182,6 +176,175 @@ pub fn expand_ranked_candidates_with_provenance(
     }
 
     candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_token_assignments(
+    next_slot: usize,
+    token_slots: &[usize],
+    tokens: &[String],
+    token_indices: &mut Vec<usize>,
+    pattern: &str,
+    number: &str,
+    first_symbol: &str,
+    second_symbol: &str,
+    length: usize,
+    excluded: &mut HashSet<String>,
+    candidates: &mut Vec<GeneratedCandidate>,
+    amount: usize,
+    source_phase: &str,
+) -> bool {
+    if next_slot == token_slots.len() {
+        let candidate = render_candidate_with_token_slots(
+            pattern,
+            token_slots,
+            token_indices,
+            tokens,
+            number,
+            first_symbol,
+            second_symbol,
+        );
+
+        for (case_variant, variant) in case_variants(&candidate) {
+            if variant.chars().count() == length && excluded.insert(variant.clone()) {
+                candidates.push(GeneratedCandidate {
+                    password: variant,
+                    source_pattern: pattern.to_string(),
+                    source_phase: source_phase.to_string(),
+                    case_variant: case_variant.to_string(),
+                });
+                if candidates.len() == amount {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    for token_index in 0..tokens.len() {
+        token_indices.push(token_index);
+        if append_token_assignments(
+            next_slot + 1,
+            token_slots,
+            tokens,
+            token_indices,
+            pattern,
+            number,
+            first_symbol,
+            second_symbol,
+            length,
+            excluded,
+            candidates,
+            amount,
+            source_phase,
+        ) {
+            return true;
+        }
+        token_indices.pop();
+    }
+
+    false
+}
+
+fn pattern_token_slots(pattern: &str) -> Vec<usize> {
+    let mut slots = BTreeSet::new();
+    let mut remainder = pattern;
+
+    while !remainder.is_empty() {
+        let after_open = remainder
+            .strip_prefix('{')
+            .expect("validated patterns only contain placeholders");
+        let end = after_open
+            .find('}')
+            .expect("validated patterns only contain complete placeholders");
+        if let Some(slot) = token_slot_index(&after_open[..end]) {
+            slots.insert(slot);
+        }
+        remainder = &after_open[end + 1..];
+    }
+
+    slots.into_iter().collect()
+}
+
+fn prioritized_token_arities(
+    tokens: &[String],
+    numbers: &[String],
+    symbols: &[String],
+    lengths: &[usize],
+    max_token_slots: usize,
+) -> Vec<usize> {
+    let Some(max_requested_length) = lengths.iter().copied().max() else {
+        return Vec::new();
+    };
+    let Some(shortest_token_length) = tokens.iter().map(|token| token.chars().count()).min() else {
+        return Vec::new();
+    };
+    if shortest_token_length == 0 {
+        return Vec::new();
+    }
+
+    // ASCII case variants preserve character counts, so this is a safe
+    // exhaustive-pruning bound. Unicode case conversion can change a string's
+    // character count; retain every configured arity in that case and use the
+    // final variant-length check as the authority.
+    let effective_max = if tokens.iter().all(|token| token.is_ascii()) {
+        max_token_slots.min(max_requested_length / shortest_token_length)
+    } else {
+        max_token_slots
+    };
+    if effective_max == 0 {
+        return Vec::new();
+    }
+
+    let mut extra_lengths = BTreeSet::from([0_usize]);
+    let symbol_counts: &[usize] = if symbols.is_empty() { &[0] } else { &[0, 1, 2] };
+    for number in numbers {
+        let number_length = number.chars().count();
+        for &symbol_count in symbol_counts {
+            extra_lengths.insert(number_length + symbol_count);
+        }
+    }
+    for &symbol_count in symbol_counts {
+        extra_lengths.insert(symbol_count);
+    }
+
+    let token_lengths: Vec<usize> = tokens.iter().map(|token| token.chars().count()).collect();
+    let mut reachable_sums = vec![false; max_requested_length + 1];
+    reachable_sums[0] = true;
+    let mut arities = Vec::with_capacity(effective_max);
+
+    for arity in 1..=effective_max {
+        let mut next_sums = vec![false; max_requested_length + 1];
+        for (sum, reachable) in reachable_sums.iter().enumerate() {
+            if !reachable {
+                continue;
+            }
+            for token_length in &token_lengths {
+                if let Some(next_sum) = sum.checked_add(*token_length)
+                    && next_sum <= max_requested_length
+                {
+                    next_sums[next_sum] = true;
+                }
+            }
+        }
+        reachable_sums = next_sums;
+
+        let earliest_length_rank = lengths
+            .iter()
+            .position(|target_length| {
+                extra_lengths.iter().any(|extra_length| {
+                    target_length
+                        .checked_sub(*extra_length)
+                        .is_some_and(|token_length| reachable_sums[token_length])
+                })
+            })
+            .unwrap_or(usize::MAX);
+        arities.push((earliest_length_rank, arity));
+    }
+
+    arities.sort_unstable();
+    arities.into_iter().map(|(_, arity)| arity).collect()
 }
 
 fn expansion_symbols(search_space: &SearchSpace) -> Vec<String> {
@@ -207,12 +370,14 @@ fn expansion_symbols(search_space: &SearchSpace) -> Vec<String> {
 fn pattern_phases(
     search_space: &SearchSpace,
     allowed_patterns: &AllowedPatterns,
-) -> [Vec<String>; 5] {
+    fallback_token_arities: &[usize],
+) -> [Vec<String>; 6] {
     let mut weighted_model_patterns: Vec<String> = search_space
         .likely_patterns
         .iter()
         .filter(|pattern| {
-            is_valid_pattern(pattern) && search_space.pattern_weights.contains_key(*pattern)
+            is_valid_pattern_with_max_token_slots(pattern, allowed_patterns.max_token_slots())
+                && search_space.pattern_weights.contains_key(*pattern)
         })
         .cloned()
         .collect();
@@ -224,7 +389,8 @@ fn pattern_phases(
         .likely_patterns
         .iter()
         .filter(|pattern| {
-            is_valid_pattern(pattern) && !search_space.pattern_weights.contains_key(*pattern)
+            is_valid_pattern_with_max_token_slots(pattern, allowed_patterns.max_token_slots())
+                && !search_space.pattern_weights.contains_key(*pattern)
         })
         .cloned()
         .collect();
@@ -233,17 +399,28 @@ fn pattern_phases(
         .chain(unweighted_model_patterns.iter())
         .map(String::as_str)
         .collect();
-    let fallback_patterns: Vec<String> = allowed_patterns
-        .as_slice()
-        .iter()
+    let configured_fallback_patterns: Vec<String> = allowed_patterns
+        .explicit_patterns()
+        .into_iter()
         .filter(|pattern| !model_patterns.contains(pattern.as_str()))
-        .cloned()
+        .collect();
+
+    let mut known_base_patterns: HashSet<String> = model_patterns
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+    known_base_patterns.extend(configured_fallback_patterns.iter().cloned());
+    let generated_fallback_patterns: Vec<String> = allowed_patterns
+        .generated_fallback_patterns_for_token_arities(fallback_token_arities)
+        .into_iter()
+        .filter(|pattern| known_base_patterns.insert(pattern.clone()))
         .collect();
 
     let mutation_sources: Vec<&str> = weighted_model_patterns
         .iter()
         .chain(unweighted_model_patterns.iter())
-        .chain(fallback_patterns.iter())
+        .chain(configured_fallback_patterns.iter())
+        .chain(generated_fallback_patterns.iter())
         .map(String::as_str)
         .collect();
 
@@ -273,7 +450,8 @@ fn pattern_phases(
     [
         weighted_model_patterns,
         unweighted_model_patterns,
-        fallback_patterns,
+        configured_fallback_patterns,
+        generated_fallback_patterns,
         one_symbol_mutations,
         two_symbol_mutations,
     ]
@@ -328,18 +506,21 @@ fn expansion_numbers(search_space: &SearchSpace) -> Vec<String> {
     }
 }
 
-fn render_candidate(
+fn render_candidate_with_token_slots(
     pattern: &str,
-    first: &str,
-    second: &str,
+    token_slots: &[usize],
+    token_indices: &[usize],
+    tokens: &[String],
     number: &str,
     first_symbol: &str,
     second_symbol: &str,
 ) -> String {
     let mut candidate = String::with_capacity(
         pattern.len()
-            + first.len()
-            + second.len()
+            + token_indices
+                .iter()
+                .map(|index| tokens[*index].len())
+                .sum::<usize>()
             + number.len()
             + first_symbol.len()
             + second_symbol.len(),
@@ -354,9 +535,8 @@ fn render_candidate(
         let end = after_open
             .find('}')
             .expect("validated patterns only contain complete placeholders");
-        let value = match &after_open[..end] {
-            "token" | "token1" => first,
-            "token2" => second,
+        let placeholder = &after_open[..end];
+        let value = match placeholder {
             "number" | "year" => number,
             "symbol" => {
                 let symbol = match symbol_occurrence {
@@ -367,13 +547,47 @@ fn render_candidate(
                 symbol_occurrence += 1;
                 symbol
             }
-            _ => unreachable!("validated patterns only contain supported placeholders"),
+            _ => {
+                let token_slot = token_slot_index(placeholder)
+                    .expect("validated patterns only contain supported placeholders");
+                let binding_index = token_slots
+                    .binary_search(&token_slot)
+                    .expect("every token slot has a selected token");
+                tokens[token_indices[binding_index]].as_str()
+            }
         };
         candidate.push_str(value);
         remainder = &after_open[end + 1..];
     }
 
     candidate
+}
+
+#[cfg(test)]
+fn render_candidate(
+    pattern: &str,
+    first: &str,
+    second: &str,
+    number: &str,
+    first_symbol: &str,
+    second_symbol: &str,
+) -> String {
+    let token_slots = pattern_token_slots(pattern);
+    let tokens = vec![first.to_string(), second.to_string()];
+    let token_indices = token_slots
+        .iter()
+        .map(|slot| usize::from(*slot == 2))
+        .collect::<Vec<_>>();
+
+    render_candidate_with_token_slots(
+        pattern,
+        &token_slots,
+        &token_indices,
+        &tokens,
+        number,
+        first_symbol,
+        second_symbol,
+    )
 }
 
 fn case_variants(candidate: &str) -> Vec<(&'static str, String)> {
@@ -403,7 +617,7 @@ mod tests {
         expand_candidates as expand_candidates_with_allowed_patterns,
         expand_ranked_candidates as expand_ranked_candidates_with_allowed_patterns,
         expand_ranked_candidates_with_provenance, expansion_numbers, expansion_symbols,
-        pattern_phases, render_candidate,
+        pattern_phases, prioritized_token_arities, render_candidate,
     };
     use crate::search_space::{AllowedPatterns, SearchSpace};
 
@@ -519,16 +733,18 @@ mod tests {
         let [
             weighted,
             unweighted,
-            fallback,
+            configured_fallback,
+            generated_fallback,
             one_symbol_mutations,
             two_symbol_mutations,
-        ] = pattern_phases(&search_space, &default_allowed_patterns());
+        ] = pattern_phases(&search_space, &default_allowed_patterns(), &[1, 2]);
 
         assert_eq!(weighted, vec!["{token}{year}", "{token}{number}"]);
         assert_eq!(unweighted, vec!["{token1}{token2}"]);
-        assert!(!fallback.contains(&"{token}{year}".to_string()));
-        assert!(!fallback.contains(&"{token}{number}".to_string()));
-        assert!(!fallback.contains(&"{token1}{token2}".to_string()));
+        assert!(configured_fallback.is_empty());
+        assert!(!generated_fallback.contains(&"{token}{year}".to_string()));
+        assert!(!generated_fallback.contains(&"{token}{number}".to_string()));
+        assert!(!generated_fallback.contains(&"{token1}{token2}".to_string()));
         assert!(one_symbol_mutations.contains(&"{symbol}{token1}{token2}".to_string()));
         assert!(one_symbol_mutations.contains(&"{token1}{token2}{symbol}".to_string()));
         assert!(two_symbol_mutations.contains(&"{token1}{symbol}{token2}{symbol}".to_string()));
@@ -553,7 +769,8 @@ mod tests {
             pattern_weights,
         };
 
-        let [weighted, _, fallback, _, _] = pattern_phases(&search_space, &allowed_patterns);
+        let [weighted, _, fallback, _, _, _] =
+            pattern_phases(&search_space, &allowed_patterns, &[1]);
 
         assert_eq!(weighted, vec!["{token}{year}"]);
         assert_eq!(fallback, vec!["{token}{number}", "{token}"]);
@@ -692,6 +909,229 @@ mod tests {
     }
 
     #[test]
+    fn expands_three_independent_token_slots_exhaustively() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec!["0".to_string(), "1".to_string(), "2".to_string()],
+            secondary_tokens: vec![],
+            important_numbers: vec![],
+            preferred_symbols: vec![],
+            likely_patterns: vec!["{token1}{token2}{token3}".to_string()],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut excluded = HashSet::new();
+
+        let candidates = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[3],
+            27,
+            &mut excluded,
+        );
+        let passwords: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.password.as_str())
+            .collect();
+
+        assert_eq!(passwords.len(), 27);
+        assert!(passwords.contains(&"000"));
+        assert!(passwords.contains(&"012"));
+        assert!(passwords.contains(&"222"));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source_phase == "unweighted_model")
+        );
+    }
+
+    #[test]
+    fn repeated_token_indices_reuse_the_same_selected_value() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec!["0".to_string(), "1".to_string()],
+            secondary_tokens: vec![],
+            important_numbers: vec![],
+            preferred_symbols: vec![],
+            likely_patterns: vec!["{token1}{token1}{token2}".to_string()],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut excluded = HashSet::new();
+
+        let candidates = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[3],
+            4,
+            &mut excluded,
+        );
+        let passwords: Vec<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.password)
+            .collect();
+
+        assert_eq!(passwords, vec!["000", "001", "110", "111"]);
+    }
+
+    #[test]
+    fn generated_fallback_covers_three_token_combinations() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token_sequence}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec!["0".to_string(), "1".to_string(), "2".to_string()],
+            secondary_tokens: vec![],
+            important_numbers: vec![],
+            preferred_symbols: vec![],
+            likely_patterns: vec![],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut excluded = HashSet::new();
+
+        let candidates = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[3],
+            27,
+            &mut excluded,
+        );
+
+        assert_eq!(candidates.len(), 27);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source_phase == "generated_fallback")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.password == "012")
+        );
+    }
+
+    #[test]
+    fn three_token_batches_match_the_single_exhaustive_prefix() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec!["0".to_string(), "1".to_string(), "2".to_string()],
+            secondary_tokens: vec![],
+            important_numbers: vec![],
+            preferred_symbols: vec![],
+            likely_patterns: vec!["{token1}{token2}{token3}".to_string()],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut one_shot_excluded = HashSet::new();
+        let one_shot = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[3],
+            27,
+            &mut one_shot_excluded,
+        );
+        let mut batched_excluded = HashSet::new();
+        let mut batched = Vec::new();
+
+        while batched.len() < one_shot.len() {
+            let remaining = one_shot.len() - batched.len();
+            let batch = expand_ranked_candidates_with_provenance(
+                &search_space,
+                &allowed_patterns,
+                &[3],
+                remaining.min(5),
+                &mut batched_excluded,
+            );
+            assert!(!batch.is_empty());
+            batched.extend(batch);
+        }
+
+        assert_eq!(batched, one_shot);
+    }
+
+    #[test]
+    fn length_aware_fallback_order_starts_at_the_first_feasible_arity() {
+        let tokens = vec!["abcdef".to_string()];
+        let numbers = vec!["1".to_string()];
+        let symbols = vec!["!".to_string()];
+
+        let arities = prioritized_token_arities(&tokens, &numbers, &symbols, &[25], 6);
+
+        assert_eq!(arities.first(), Some(&4));
+        assert_eq!(arities.len(), 4);
+    }
+
+    #[test]
+    fn six_token_slots_make_a_six_component_candidate_reachable() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec![
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+                "5".to_string(),
+            ],
+            secondary_tokens: vec![],
+            important_numbers: vec![],
+            preferred_symbols: vec![],
+            likely_patterns: vec!["{token1}{token2}{token3}{token4}{token5}{token6}".to_string()],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut excluded = HashSet::new();
+
+        let candidates = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[6],
+            2_000,
+            &mut excluded,
+        );
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.password == "012345")
+        );
+    }
+
+    #[test]
+    fn three_token_patterns_work_with_symbols_and_years() {
+        let allowed_patterns =
+            AllowedPatterns::parse("{token}\n", "test allowed patterns").unwrap();
+        let search_space = SearchSpace {
+            primary_tokens: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            secondary_tokens: vec![],
+            important_numbers: vec!["99".to_string()],
+            preferred_symbols: vec!["@".to_string()],
+            likely_patterns: vec!["{token1}{symbol}{token2}{year}{token3}".to_string()],
+            likely_lengths: vec![],
+            pattern_weights: HashMap::new(),
+        };
+        let mut excluded = HashSet::new();
+
+        let candidates = expand_ranked_candidates_with_provenance(
+            &search_space,
+            &allowed_patterns,
+            &[6],
+            1_000,
+            &mut excluded,
+        );
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.password == "A@B99C")
+        );
+    }
+
+    #[test]
     fn expands_two_tokens_number_and_symbol() {
         let search_space = SearchSpace {
             primary_tokens: vec!["Victor".to_string()],
@@ -823,10 +1263,11 @@ mod tests {
         let [
             weighted,
             _,
+            _,
             fallback,
             one_symbol_mutations,
             two_symbol_mutations,
-        ] = pattern_phases(&search_space, &default_allowed_patterns());
+        ] = pattern_phases(&search_space, &default_allowed_patterns(), &[1, 2]);
         let numbers = expansion_numbers(&search_space);
         let symbols = expansion_symbols(&search_space);
 

@@ -4,8 +4,25 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const ALLOWED_PLACEHOLDERS: [&str; 6] =
-    ["token", "token1", "token2", "number", "year", "symbol"];
+/// The default upper bound for independently selected token slots in one
+/// pattern. Researchers can raise or lower it with `--max-token-slots`.
+pub const DEFAULT_MAX_TOKEN_SLOTS: usize = 6;
+
+/// The hard ceiling follows the maximum supported password length. Larger
+/// values cannot contribute to a candidate of 32 or fewer non-empty Unicode
+/// characters, and would make the fallback search needlessly unbounded.
+pub const MAX_TOKEN_SLOTS: usize = 32;
+
+const MAX_NUMERIC_PLACEHOLDERS: usize = 1;
+const MAX_SYMBOL_PLACEHOLDERS: usize = 2;
+
+/// Fallback-only macros accepted in `allowed_patterns.txt`.
+///
+/// They are expanded at runtime into concrete `{token1}`...`{tokenN}`
+/// templates up to the selected token-slot cap. Model output must use concrete
+/// placeholders so its ranking remains explicit and recordable.
+pub const TOKEN_SEQUENCE_PATTERN: &str = "{token_sequence}";
+pub const TOKEN_SEQUENCE_WITH_NUMBER_PATTERN: &str = "{token_sequence_with_number}";
 
 pub const DEFAULT_ALLOWED_PATTERNS_PATH: &str = "config/allowed_patterns.txt";
 
@@ -13,26 +30,45 @@ pub const DEFAULT_ALLOWED_PATTERNS_PATH: &str = "config/allowed_patterns.txt";
 ///
 /// The file is parsed once at program startup, so researchers can inspect and
 /// adjust the fallback set without editing Rust source or rebuilding. Every
-/// non-empty, non-comment line must be a unique non-symbol pattern accepted by
-/// `is_valid_pattern`. Symbols remain Rust-derived mutations, preserving the
-/// global base -> one-symbol -> two-symbol phase order.
+/// non-empty, non-comment line must be a unique non-symbol literal pattern or
+/// a supported fallback macro. Symbols remain Rust-derived mutations,
+/// preserving the global base -> one-symbol -> two-symbol phase order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedPatterns {
     patterns: Vec<String>,
+    max_token_slots: usize,
 }
 
 impl AllowedPatterns {
+    #[allow(dead_code)]
     pub fn from_file(path: &Path) -> Result<Self, String> {
+        Self::from_file_with_max_token_slots(path, DEFAULT_MAX_TOKEN_SLOTS)
+    }
+
+    pub fn from_file_with_max_token_slots(
+        path: &Path,
+        max_token_slots: usize,
+    ) -> Result<Self, String> {
         let contents = fs::read_to_string(path).map_err(|error| {
             format!(
                 "could not read allowed patterns file {}: {error}",
                 path.display()
             )
         })?;
-        Self::parse(&contents, &path.display().to_string())
+        Self::parse_with_max_token_slots(&contents, &path.display().to_string(), max_token_slots)
     }
 
+    #[allow(dead_code)]
     pub fn parse(contents: &str, source: &str) -> Result<Self, String> {
+        Self::parse_with_max_token_slots(contents, source, DEFAULT_MAX_TOKEN_SLOTS)
+    }
+
+    pub fn parse_with_max_token_slots(
+        contents: &str,
+        source: &str,
+        max_token_slots: usize,
+    ) -> Result<Self, String> {
+        validate_max_token_slots(max_token_slots)?;
         let mut patterns = Vec::new();
 
         for (line_index, line) in contents.lines().enumerate() {
@@ -40,9 +76,9 @@ impl AllowedPatterns {
             if pattern.is_empty() || pattern.starts_with('#') {
                 continue;
             }
-            if !is_valid_pattern(pattern) {
+            if !is_valid_allowed_pattern(pattern, max_token_slots) {
                 return Err(format!(
-                    "{source}: line {} is not a valid allowed pattern: {pattern}",
+                    "{source}: line {} is not a valid allowed pattern or fallback macro: {pattern}",
                     line_index + 1
                 ));
             }
@@ -67,15 +103,112 @@ impl AllowedPatterns {
             ));
         }
 
-        Ok(Self { patterns })
+        Ok(Self {
+            patterns,
+            max_token_slots,
+        })
     }
 
+    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[String] {
         &self.patterns
     }
 
     pub fn len(&self) -> usize {
         self.patterns.len()
+    }
+
+    pub fn max_token_slots(&self) -> usize {
+        self.max_token_slots
+    }
+
+    /// Return literal fallback patterns in their configured file order.
+    pub fn explicit_patterns(&self) -> Vec<String> {
+        self.patterns
+            .iter()
+            .filter(|pattern| !is_fallback_macro(pattern))
+            .cloned()
+            .collect()
+    }
+
+    /// Expand the fallback-only sequence macros for the arities supplied by
+    /// the expander. These automatic coverage patterns form a distinct phase
+    /// after literal configured fallback patterns.
+    pub fn generated_fallback_patterns_for_token_arities(
+        &self,
+        token_arities: &[usize],
+    ) -> Vec<String> {
+        let mut expanded = Vec::new();
+
+        for pattern in &self.patterns {
+            match pattern.as_str() {
+                TOKEN_SEQUENCE_PATTERN => {
+                    for &arity in token_arities {
+                        if (1..=self.max_token_slots).contains(&arity) {
+                            push_unique(&mut expanded, token_sequence_pattern(arity));
+                        }
+                    }
+                }
+                TOKEN_SEQUENCE_WITH_NUMBER_PATTERN => {
+                    for &arity in token_arities {
+                        if !(1..=self.max_token_slots).contains(&arity) {
+                            continue;
+                        }
+                        for number_position in 0..=arity {
+                            push_unique(
+                                &mut expanded,
+                                token_sequence_with_number_pattern(arity, number_position),
+                            );
+                        }
+                    }
+                }
+                _ => push_unique(&mut expanded, pattern.clone()),
+            }
+        }
+
+        expanded
+    }
+}
+
+fn is_fallback_macro(pattern: &str) -> bool {
+    matches!(
+        pattern,
+        TOKEN_SEQUENCE_PATTERN | TOKEN_SEQUENCE_WITH_NUMBER_PATTERN
+    )
+}
+
+fn is_valid_allowed_pattern(pattern: &str, max_token_slots: usize) -> bool {
+    is_fallback_macro(pattern) || is_valid_pattern_with_max_token_slots(pattern, max_token_slots)
+}
+
+fn token_sequence_pattern(arity: usize) -> String {
+    if arity == 1 {
+        return "{token}".to_string();
+    }
+
+    (1..=arity).map(|slot| format!("{{token{slot}}}")).collect()
+}
+
+fn token_sequence_with_number_pattern(arity: usize, number_position: usize) -> String {
+    let mut pattern = String::new();
+    for token_position in 0..=arity {
+        if token_position == number_position {
+            pattern.push_str("{number}");
+        }
+        if token_position < arity {
+            if arity == 1 {
+                pattern.push_str("{token}");
+            } else {
+                pattern.push_str(&format!("{{token{}}}", token_position + 1));
+            }
+        }
+    }
+    pattern
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -138,7 +271,13 @@ pub struct SearchSpace {
 }
 
 impl SearchSpace {
-    pub fn validate(mut self) -> Result<Self, String> {
+    #[allow(dead_code)]
+    pub fn validate(self) -> Result<Self, String> {
+        self.validate_with_max_token_slots(DEFAULT_MAX_TOKEN_SLOTS)
+    }
+
+    pub fn validate_with_max_token_slots(mut self, max_token_slots: usize) -> Result<Self, String> {
+        validate_max_token_slots(max_token_slots)?;
         normalize_values(&mut self.primary_tokens);
         normalize_values(&mut self.secondary_tokens);
         normalize_values(&mut self.important_numbers);
@@ -172,7 +311,7 @@ impl SearchSpace {
         if self
             .likely_patterns
             .iter()
-            .any(|pattern| !is_valid_pattern(pattern))
+            .any(|pattern| !is_valid_pattern_with_max_token_slots(pattern, max_token_slots))
         {
             return Err("likely_patterns contains an invalid placeholder".to_string());
         }
@@ -187,7 +326,7 @@ impl SearchSpace {
 
         if self.pattern_weights.iter().any(|(pattern, weight)| {
             !self.likely_patterns.contains(pattern)
-                || !is_valid_pattern(pattern)
+                || !is_valid_pattern_with_max_token_slots(pattern, max_token_slots)
                 || !weight.is_finite()
                 || !(0.0..=1.0).contains(weight)
         }) {
@@ -201,13 +340,32 @@ impl SearchSpace {
     }
 }
 
+pub fn validate_max_token_slots(max_token_slots: usize) -> Result<(), String> {
+    if (1..=MAX_TOKEN_SLOTS).contains(&max_token_slots) {
+        Ok(())
+    } else {
+        Err(format!(
+            "max token slots must be between 1 and {MAX_TOKEN_SLOTS}"
+        ))
+    }
+}
+
+#[allow(dead_code)]
 pub fn is_valid_pattern(pattern: &str) -> bool {
-    let Some(parts) = pattern_parts(pattern) else {
+    is_valid_pattern_with_max_token_slots(pattern, DEFAULT_MAX_TOKEN_SLOTS)
+}
+
+pub fn is_valid_pattern_with_max_token_slots(pattern: &str, max_token_slots: usize) -> bool {
+    if validate_max_token_slots(max_token_slots).is_err() {
+        return false;
+    }
+
+    let Some(parts) = pattern_parts_with_max_token_slots(pattern, max_token_slots) else {
         return false;
     };
     let token_count = parts
         .iter()
-        .filter(|placeholder| placeholder.starts_with("token"))
+        .filter(|placeholder| token_slot_index(placeholder).is_some())
         .count();
     let number_count = parts
         .iter()
@@ -218,7 +376,10 @@ pub fn is_valid_pattern(pattern: &str) -> bool {
         .filter(|placeholder| **placeholder == "symbol")
         .count();
 
-    (1..=2).contains(&token_count) && number_count <= 1 && symbol_count <= 2 && parts.len() <= 5
+    (1..=max_token_slots).contains(&token_count)
+        && number_count <= MAX_NUMERIC_PLACEHOLDERS
+        && symbol_count <= MAX_SYMBOL_PLACEHOLDERS
+        && parts.len() <= max_token_slots + MAX_NUMERIC_PLACEHOLDERS + MAX_SYMBOL_PLACEHOLDERS
 }
 
 /// Insert one `{symbol}` placeholder at every component boundary in a valid
@@ -227,7 +388,8 @@ pub fn rust_derived_symbol_mutations(pattern: &str) -> Vec<String> {
     let Some(parts) = pattern_parts(pattern) else {
         return Vec::new();
     };
-    if !is_valid_pattern(pattern) || parts.iter().any(|placeholder| *placeholder == "symbol") {
+    if !is_valid_pattern_with_max_token_slots(pattern, MAX_TOKEN_SLOTS) || parts.contains(&"symbol")
+    {
         return Vec::new();
     }
 
@@ -246,7 +408,8 @@ pub fn rust_derived_two_symbol_mutations(pattern: &str) -> Vec<String> {
     let Some(parts) = pattern_parts(pattern) else {
         return Vec::new();
     };
-    if !is_valid_pattern(pattern) || parts.iter().any(|placeholder| *placeholder == "symbol") {
+    if !is_valid_pattern_with_max_token_slots(pattern, MAX_TOKEN_SLOTS) || parts.contains(&"symbol")
+    {
         return Vec::new();
     }
 
@@ -289,6 +452,10 @@ fn pattern_with_symbol_insertions(parts: &[&str], insertion_points: &[usize]) ->
 }
 
 fn pattern_parts(pattern: &str) -> Option<Vec<&str>> {
+    pattern_parts_with_max_token_slots(pattern, MAX_TOKEN_SLOTS)
+}
+
+fn pattern_parts_with_max_token_slots(pattern: &str, max_token_slots: usize) -> Option<Vec<&str>> {
     if pattern.is_empty() {
         return None;
     }
@@ -299,13 +466,36 @@ fn pattern_parts(pattern: &str) -> Option<Vec<&str>> {
         let after_open = remainder.strip_prefix('{')?;
         let end = after_open.find('}')?;
         let placeholder = &after_open[..end];
-        if !ALLOWED_PLACEHOLDERS.contains(&placeholder) {
+        if !is_allowed_placeholder(placeholder, max_token_slots) {
             return None;
         }
         parts.push(placeholder);
         remainder = &after_open[end + 1..];
     }
     (!parts.is_empty()).then_some(parts)
+}
+
+/// Return the positive indexed token slot represented by a placeholder.
+/// `{token}` remains the backwards-compatible alias for slot one.
+pub fn token_slot_index(placeholder: &str) -> Option<usize> {
+    if placeholder == "token" {
+        return Some(1);
+    }
+
+    let suffix = placeholder.strip_prefix("token")?;
+    if suffix.is_empty()
+        || suffix.starts_with('0')
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let slot = suffix.parse::<usize>().ok()?;
+    (1..=MAX_TOKEN_SLOTS).contains(&slot).then_some(slot)
+}
+
+fn is_allowed_placeholder(placeholder: &str, max_token_slots: usize) -> bool {
+    token_slot_index(placeholder).is_some_and(|slot| slot <= max_token_slots)
+        || matches!(placeholder, "number" | "year" | "symbol")
 }
 
 fn normalize_values(values: &mut Vec<String>) {
@@ -324,9 +514,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AllowedPatterns, SearchSpace, default_allowed_patterns_path, is_valid_pattern,
-        rust_derived_symbol_mutations, rust_derived_two_symbol_mutations, rust_numbers,
-        rust_symbols,
+        AllowedPatterns, DEFAULT_MAX_TOKEN_SLOTS, SearchSpace, default_allowed_patterns_path,
+        is_valid_pattern, is_valid_pattern_with_max_token_slots, rust_derived_symbol_mutations,
+        rust_derived_two_symbol_mutations, rust_numbers, rust_symbols,
     };
 
     #[test]
@@ -398,10 +588,20 @@ mod tests {
     fn enforces_the_bounded_placeholder_grammar() {
         assert!(is_valid_pattern("{token}{symbol}{token}{year}"));
         assert!(is_valid_pattern("{token1}{symbol}{token2}{symbol}{number}"));
+        assert!(is_valid_pattern("{token1}{symbol}{token2}{year}{token3}"));
+        assert!(is_valid_pattern(
+            "{token1}{token2}{token3}{token4}{token5}{token6}{number}{symbol}{symbol}"
+        ));
         assert!(!is_valid_pattern("prefix{token}"));
         assert!(!is_valid_pattern("{token}{number}{year}"));
         assert!(!is_valid_pattern("{token}{symbol}{symbol}{symbol}"));
-        assert!(!is_valid_pattern("{token}{token1}{number}{symbol}{token2}"));
+        assert!(!is_valid_pattern("{token0}{token1}"));
+        assert!(!is_valid_pattern("{token01}{token1}"));
+        assert!(!is_valid_pattern("{token7}"));
+        assert!(is_valid_pattern_with_max_token_slots("{token7}", 7));
+        assert!(!is_valid_pattern(
+            "{token1}{token2}{token3}{token4}{token5}{token6}{token1}"
+        ));
     }
 
     #[test]
@@ -488,19 +688,19 @@ mod tests {
         assert_eq!(
             patterns.as_slice(),
             &[
-                "{token}".to_string(),
-                "{token}{number}".to_string(),
-                "{number}{token}".to_string(),
-                "{token}{year}".to_string(),
-                "{year}{token}".to_string(),
-                "{token1}{token2}".to_string(),
-                "{token}{token}".to_string(),
-                "{token1}{token2}{number}".to_string(),
-                "{token1}{number}{token2}".to_string(),
-                "{number}{token1}{token2}".to_string(),
-                "{token1}{token2}{year}".to_string(),
-                "{token1}{year}{token2}".to_string(),
-                "{year}{token1}{token2}".to_string(),
+                "{token_sequence}".to_string(),
+                "{token_sequence_with_number}".to_string(),
+            ]
+        );
+        assert_eq!(patterns.max_token_slots(), DEFAULT_MAX_TOKEN_SLOTS);
+        assert_eq!(
+            patterns.generated_fallback_patterns_for_token_arities(&[3]),
+            vec![
+                "{token1}{token2}{token3}".to_string(),
+                "{number}{token1}{token2}{token3}".to_string(),
+                "{token1}{number}{token2}{token3}".to_string(),
+                "{token1}{token2}{number}{token3}".to_string(),
+                "{token1}{token2}{token3}{number}".to_string(),
             ]
         );
     }

@@ -26,19 +26,17 @@ SEARCH_SPACE_FIELDS = (
 )
 
 
-ALLOWED_PLACEHOLDERS = {
-    "token",
-    "token1",
-    "token2",
+DEFAULT_MAX_TOKEN_SLOTS = 6
+MAX_TOKEN_SLOTS = 32
+
+NON_TOKEN_PLACEHOLDERS = {
     "number",
     "year",
     "symbol",
 }
 
-MAX_TOKEN_PLACEHOLDERS = 2
 MAX_NUMERIC_PLACEHOLDERS = 1
 MAX_SYMBOL_PLACEHOLDERS = 2
-MAX_PATTERN_PLACEHOLDERS = 5
 
 
 SYSTEM_PROMPT = """
@@ -69,13 +67,9 @@ Rules:
 2. Include only concepts reasonably supported by the supplied persona.
 3. Do not invent unsupported personal information.
 4. Do not output complete password candidates.
-5. Valid pattern variables are:
-   {token}
-   {token1}
-   {token2}
-   {number}
-   {year}
-   {symbol}
+5. Valid pattern variables are `{token}` (an alias of `{token1}`), indexed
+token slots from `{token1}` through `{token{max_token_slots}}`, `{number}`,
+`{year}`, and `{symbol}`.
 6. Keep the search space compact and relevant.
 7. Use an empty array when a category has no relevant values.
 8. For broad categories such as NATO phonetic alphabet, include only the
@@ -83,11 +77,43 @@ concepts directly supported by the persona.
 9. Patterns are ranking hints only: Rust will deterministically enumerate its
 own fallback templates and one- and two-symbol mutations after every model
 pattern.
-10. A pattern must contain one or two token placeholders, at most one of
-{number}/{year}, at most two {symbol} placeholders, and no literal text.
+10. A pattern must contain one through {max_token_slots} token placeholder
+occurrences. Token indices must be positive and no greater than
+{max_token_slots}; repeating an index reuses that selected token. Use distinct
+indices for independently selected tokens. A pattern may contain at most one
+of {number}/{year}, at most two {symbol} placeholders, and no literal text.
 When {symbol} appears twice, each occurrence is an independently selected
 symbol value.
 """.strip()
+
+
+def validate_max_token_slots(max_token_slots: int) -> int:
+    """Validate the Rust-selected upper bound for indexed token slots."""
+
+    if (
+        isinstance(max_token_slots, bool)
+        or not isinstance(max_token_slots, int)
+        or not 1 <= max_token_slots <= MAX_TOKEN_SLOTS
+    ):
+        raise ValueError(
+            "max_token_slots must be an integer from 1 "
+            f"to {MAX_TOKEN_SLOTS}."
+        )
+
+    return max_token_slots
+
+
+def system_prompt(max_token_slots: int) -> str:
+    """Return the dynamic grammar instruction shared with Rust."""
+
+    max_token_slots = validate_max_token_slots(
+        max_token_slots
+    )
+
+    return SYSTEM_PROMPT.replace(
+        "{max_token_slots}",
+        str(max_token_slots),
+    )
 
 
 def create_client() -> OpenAI:
@@ -152,14 +178,20 @@ def configured_model_id() -> str:
 
 def generate_search_space_with_model_output(
     persona: dict[str, Any],
+    max_token_slots: int = DEFAULT_MAX_TOKEN_SLOTS,
 ) -> tuple[dict[str, Any], str, str]:
     """
     Query the dedicated Hugging Face endpoint and return the validated
     SearchSpace, raw model response, and configured model identifier.
     """
 
+    max_token_slots = validate_max_token_slots(
+        max_token_slots
+    )
+
     raw_response, model_id = request_huggingface(
-        persona
+        persona,
+        max_token_slots,
     )
 
     parsed = extract_json(
@@ -174,7 +206,8 @@ def generate_search_space_with_model_output(
 
     return (
         validate_search_space(
-            parsed
+            parsed,
+            max_token_slots,
         ),
         raw_response,
         model_id,
@@ -183,11 +216,13 @@ def generate_search_space_with_model_output(
 
 def generate_search_space(
     persona: dict[str, Any],
+    max_token_slots: int = DEFAULT_MAX_TOKEN_SLOTS,
 ) -> dict[str, Any]:
     """Return only the validated SearchSpace for callers that do not log runs."""
 
     search_space, _, _ = generate_search_space_with_model_output(
-        persona
+        persona,
+        max_token_slots,
     )
 
     return search_space
@@ -195,6 +230,7 @@ def generate_search_space(
 
 def request_huggingface(
     persona: dict[str, Any],
+    max_token_slots: int = DEFAULT_MAX_TOKEN_SLOTS,
 ) -> tuple[str, str]:
     """
     Send the persona to the GPT-OSS endpoint.
@@ -207,6 +243,10 @@ def request_huggingface(
 
     model = configured_model_id()
 
+    max_token_slots = validate_max_token_slots(
+        max_token_slots
+    )
+
     prompt = build_prompt(
         persona
     )
@@ -216,7 +256,7 @@ def request_huggingface(
         messages=[
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT,
+                "content": system_prompt(max_token_slots),
             },
             {
                 "role": "user",
@@ -350,10 +390,15 @@ def extract_json(
 
 def validate_search_space(
     value: dict[str, Any],
+    max_token_slots: int = DEFAULT_MAX_TOKEN_SLOTS,
 ) -> dict[str, Any]:
     """
     Validate and normalize a SearchSpace returned by the model.
     """
+
+    max_token_slots = validate_max_token_slots(
+        max_token_slots
+    )
 
     if not isinstance(value, dict):
         raise ValueError(
@@ -386,12 +431,18 @@ def validate_search_space(
     result["likely_patterns"] = [
         pattern
         for pattern in result["likely_patterns"]
-        if is_valid_pattern(pattern)
+        if is_valid_pattern_with_max_token_slots(
+            pattern,
+            max_token_slots,
+        )
     ]
 
     lengths = value.get("likely_lengths", [])
     if not isinstance(lengths, list) or not all(
-        isinstance(length, int) and 4 <= length <= 32 for length in lengths
+        isinstance(length, int)
+        and not isinstance(length, bool)
+        and 4 <= length <= 32
+        for length in lengths
     ):
         raise ValueError("likely_lengths must contain integers from 4 to 32.")
     result["likely_lengths"] = list(dict.fromkeys(lengths))
@@ -404,6 +455,7 @@ def validate_search_space(
         for pattern, weight in weights.items()
         if pattern in result["likely_patterns"]
         and isinstance(weight, (int, float))
+        and not isinstance(weight, bool)
         and 0 <= weight <= 1
     }
 
@@ -412,6 +464,25 @@ def validate_search_space(
 
 def is_valid_pattern(pattern: str) -> bool:
     """Validate the bounded placeholder grammar owned by Rust."""
+    return is_valid_pattern_with_max_token_slots(
+        pattern,
+        DEFAULT_MAX_TOKEN_SLOTS,
+    )
+
+
+def is_valid_pattern_with_max_token_slots(
+    pattern: str,
+    max_token_slots: int,
+) -> bool:
+    """Validate a model pattern against the Rust-selected token-slot cap."""
+
+    try:
+        max_token_slots = validate_max_token_slots(
+            max_token_slots
+        )
+    except ValueError:
+        return False
+
     if not isinstance(pattern, str) or "{" not in pattern:
         return False
     placeholders = re.findall(r"\{([^{}]+)\}", pattern)
@@ -420,13 +491,16 @@ def is_valid_pattern(pattern: str) -> bool:
         or "".join(f"{{{placeholder}}}" for placeholder in placeholders)
         != pattern
         or any(
-            placeholder not in ALLOWED_PLACEHOLDERS
+            not is_allowed_placeholder(
+                placeholder,
+                max_token_slots,
+            )
             for placeholder in placeholders
         )
     ):
         return False
     token_count = sum(
-        placeholder.startswith("token")
+        token_slot_index(placeholder) is not None
         for placeholder in placeholders
     )
     numeric_count = sum(
@@ -435,8 +509,39 @@ def is_valid_pattern(pattern: str) -> bool:
     )
     symbol_count = placeholders.count("symbol")
     return (
-        1 <= token_count <= MAX_TOKEN_PLACEHOLDERS
+        1 <= token_count <= max_token_slots
         and numeric_count <= MAX_NUMERIC_PLACEHOLDERS
         and symbol_count <= MAX_SYMBOL_PLACEHOLDERS
-        and len(placeholders) <= MAX_PATTERN_PLACEHOLDERS
+        and len(placeholders)
+        <= max_token_slots
+        + MAX_NUMERIC_PLACEHOLDERS
+        + MAX_SYMBOL_PLACEHOLDERS
     )
+
+
+def token_slot_index(placeholder: str) -> int | None:
+    """Return a canonical token-slot index; `{token}` aliases slot one."""
+
+    if placeholder == "token":
+        return 1
+
+    match = re.fullmatch(
+        r"token([1-9][0-9]*)",
+        placeholder,
+    )
+    if match is None:
+        return None
+
+    slot = int(match.group(1))
+    return slot if slot <= MAX_TOKEN_SLOTS else None
+
+
+def is_allowed_placeholder(
+    placeholder: str,
+    max_token_slots: int,
+) -> bool:
+    token_slot = token_slot_index(placeholder)
+    return (
+        token_slot is not None
+        and token_slot <= max_token_slots
+    ) or placeholder in NON_TOKEN_PLACEHOLDERS

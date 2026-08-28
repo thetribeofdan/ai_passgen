@@ -87,19 +87,21 @@ The model is instructed not to output complete candidates. Its pattern list is a
 Only concatenated placeholders are accepted; literal text is deliberately disallowed. The allowed placeholders are:
 
 ```text
-{token}   {token1}   {token2}   {number}   {year}   {symbol}
+{token}   {token1} ... {tokenN}   {number}   {year}   {symbol}
 ```
+
+`{token}` is an alias for `{token1}`. Distinct indexed token slots each range over the complete ordered, de-duplicated token pool; repeating an index reuses the same selected token. Thus `{token1}{token2}{token3}` enumerates ordered triples, including repeated values, while `{token1}{token1}{token2}` binds two independent values and repeats the first.
 
 The current bounded grammar allows:
 
-- one or two token placeholders;
+- one through `N` token placeholder occurrences, with indices no greater than `N`;
 - at most one numeric placeholder (`{number}` or `{year}`);
 - at most two `{symbol}` placeholders;
-- at most five placeholders in total.
+- at most `N + 3` placeholders in total.
 
-`{number}` and `{year}` are syntactically distinct ranking labels but currently draw from the same numeric value list at rendering time. Two `{symbol}` occurrences are independent slots: a pattern can produce mixed pairs such as `.@`, not only repeated pairs such as `..`.
+`N` is selected by `--max-token-slots` (default `6`, permitted range `1..=32`) and is passed from Rust to Python before the model request, so both validators apply the same bound. `{number}` and `{year}` are syntactically distinct ranking labels but currently draw from the same numeric value list at rendering time. Two `{symbol}` occurrences are independent slots: a pattern can produce mixed pairs such as `.@`, not only repeated pairs such as `..`.
 
-This grammar intentionally bounds the search. It excludes arbitrary literal affixes, three-token forms, more than one numeric field, more than two symbols, leetspeak, token truncation, token stemming, internal case permutations, and arbitrary Unicode symbol alphabets.
+This grammar intentionally bounds the search. It excludes arbitrary literal affixes, more than one numeric field, more than two symbols, leetspeak, token truncation, token stemming, internal case permutations, and arbitrary Unicode symbol alphabets. Three-or-more-token forms are supported only up to the selected `N`.
 
 ## 3. Deterministic expansion model
 
@@ -142,22 +144,18 @@ If a base pattern has `m` components, the mutation counts are `m + 1` for one sy
 
 ### Fallback base grammar
 
-The runtime file `config/allowed_patterns.txt` contains thirteen non-symbol syntactic templates by default:
+The runtime file `config/allowed_patterns.txt` contains two fallback-only macros by default:
 
 ```text
-{token}
-{token}{number}          {number}{token}
-{token}{year}            {year}{token}
-{token1}{token2}         {token}{token}
-{token1}{token2}{number} {token1}{number}{token2} {number}{token1}{token2}
-{token1}{token2}{year}   {token1}{year}{token2}   {year}{token1}{token2}
+{token_sequence}
+{token_sequence_with_number}
 ```
 
-Some syntactic forms overlap in candidate set because `{number}` and `{year}` currently use the same values, and `{token1}{token2}` already includes repeated token pairs. The duplication is tolerated because a global `HashSet` suppresses duplicate candidates. The useful property is that, within the defined grammar and the finite `T`, `N`, and `S` alphabets, Rust can enumerate every ordering of up to two token components and one numeric component, then insert zero, one, or two symbols at every boundary.
+The first expands to concrete token sequences from one through the selected `N`; the second generates the same sequences with one `{number}` at every component boundary. A sequence with distinct consecutive indices already covers every ordered token combination, including repeated values, so no permutations such as `{token2}{token1}` are necessary. `{year}` is not duplicated in the generated fallback because it renders from the same numeric value stream as `{number}`. Rust then derives zero, one, and two-symbol structures from these bases at every boundary.
 
-The file is read and validated once at program startup, before the model request. It permits blank lines and full-line `#` comments, preserves line order, and rejects missing, empty, duplicate, malformed, or symbol-bearing entries. The default is resolved from the project manifest directory; `--allowed-patterns PATH` selects an explicit experiment-specific file. Symbol placeholders are intentionally excluded from this configuration because Rust derives them in later phases, preserving the global base -> one-symbol -> two-symbol ordering.
+The file may also contain literal non-symbol patterns. It is read and validated once at program startup, before the model request; it preserves file order for those literal patterns, then emits generated fallback coverage as a separate phase. It permits blank lines and full-line `#` comments and rejects missing, empty, duplicate, malformed, or symbol-bearing entries. The default is resolved from the project manifest directory; `--allowed-patterns PATH` selects an explicit alternate file.
 
-This is the precise meaning of current fallback "exhaustiveness." The shipped default is an inspectable external allowed-pattern list, but an edited list may narrow or change coverage. It is still not coverage of every conceivable human password form.
+For exact/ranked lengths, Rust scores fallback token arities by actual Unicode character lengths of supplied tokens, numbers, and symbols. For ASCII tokens it also removes arities that cannot fit any requested length; Unicode token arities remain conservative because case conversion can change character counts. Ordering never removes remaining grammar candidates. This is the precise meaning of fallback "exhaustiveness": it covers the selected token-slot cap, configured fallback macros/literal patterns, length range, numeric alphabet, and symbol alphabet—not every conceivable human password form.
 
 ## 4. Candidate ordering and modes
 
@@ -169,13 +167,14 @@ The phase loop is outside the length loop. Consequently, a shorter fallback cand
 | --- | --- | --- |
 | 1 | Model patterns with weights, descending weight; source order breaks ties. | Prioritise model confidence. |
 | 2 | Model patterns without weights, in model order. | Preserve model preference where calibration is unavailable. |
-| 3 | Unlisted non-symbol base templates from the validated allowed-patterns file. | Cover bounded token/numeric orderings omitted by the model. |
-| 4 | One-symbol Rust-derived mutations of all eligible model and fallback sources. | Favour a common, lower-cost punctuation extension. |
-| 5 | Two-symbol Rust-derived mutations of the same sources. | Reach mixed/double punctuation forms after the simpler space is exhausted. |
+| 3 | Literal non-symbol base templates from the validated allowed-patterns file. | Preserve researcher-specified fallback priorities. |
+| 4 | Generated token-sequence fallback closure from configured macros. | Cover every selected token arity and numeric boundary omitted by the model. |
+| 5 | One-symbol Rust-derived mutations of all eligible model and fallback sources. | Favour a common, lower-cost punctuation extension. |
+| 6 | Two-symbol Rust-derived mutations of the same sources. | Reach mixed/double punctuation forms after the simpler space is exhausted. |
 
 This deliberately satisfies the "whatever the model suggests comes first" rule at the pattern level. The chosen engineering assumption is that globally exhausting one-symbol forms before two-symbol forms is sensible because multiple-symbol passwords are less common. Model-suggested two-symbol patterns remain in phases 1 or 2; only **derived** two-symbol forms wait for phase 5.
 
-Within one template, the nested order is numeric value, first symbol, second symbol, requested length, first token, second token, then casing variant. This means model numbers and their year fragments are exhausted before generic numeric values for that template, and model symbols precede Rust symbols. Exact candidates are accepted only if `candidate.chars().count()` equals the requested length.
+Within one template, the nested order is numeric value, first symbol, second symbol, requested length, then the selected token-slot bindings in ascending slot-index order, followed by casing variant. This means model numbers and their year fragments are exhausted before generic numeric values for that template, and model symbols precede Rust symbols. Exact candidates are accepted only if `candidate.chars().count()` equals the requested length.
 
 For each rendered string, Rust tries four simple case forms in this order: original, lowercase, uppercase, and first-character-capitalised with the remainder lowercased. Deduplication preserves only the first occurrence globally across all phases and batches.
 
@@ -207,14 +206,16 @@ Slow password hashes should be evaluated separately from fast digest algorithms.
 
 - run and persona identifiers;
 - condition, target hash, and selected algorithm;
-- the structured persona JSON, LLM model identifier, raw LLM response, and validated SearchSpace;
-- search-space size, cracked flag, and reported rank;
-- matched-candidate provenance when cracked: source template, generation phase, and case variant;
+- the structured persona JSON, LLM model identifier/raw response, and validated SearchSpace;
+- legacy search-space size, explicit candidates generated, actual hash-verification calls started, cracked flag, and reported rank;
+- matched-candidate provenance when cracked: source template, generation phase, case variant, and a top-level matched-phase field;
 - total, generation, verification, and wall-clock time-to-first-match durations;
-- requested thread utilisation and calculated throughputs;
+- configured verifier threads, active Rayon worker count, available logical CPUs, active-worker/configured-worker fraction, and calculated throughputs;
 - optional observed password length and pattern labels.
 
-The CLI retains concise operational summaries (including match/no-match, timing, and record location), but no longer prints raw LLM output or full candidate/batch lists. This is a useful improvement, but the record still lacks a prompt hash, endpoint revision, configuration content hashes, source commit, machine details, randomisation information, actual verifier-work count, and a globally deterministic match rank. It should therefore be treated as an improving research artefact rather than a complete reproducibility package.
+`actual_candidates_evaluated` is incremented inside the verifier predicate, so it includes every hash-verification call that began, including work already in flight when a parallel match is found. `threads_utilization` means active Rayon workers divided by configured workers; it is deliberately **not** labelled as operating-system CPU utilisation. In iterative mode, active workers are the peak observed in any verifier batch.
+
+The CLI retains concise operational summaries (including match/no-match, timing, and record location), but no longer prints raw LLM output or full candidate/batch lists. The record still lacks a prompt hash, endpoint revision, configuration content hashes, source commit, detailed machine details, randomisation information, and a globally deterministic match rank. It should therefore be treated as an improving research artefact rather than a complete reproducibility package.
 
 Duplicate plaintexts are suppressed before verification, so a recorded provenance tuple identifies the first phase, template, and case variant that emitted that plaintext.
 
@@ -231,37 +232,39 @@ Duplicate plaintexts are suppressed before verification, so a recorded provenanc
 | Independent two-symbol slots | Correctly reaches mixed punctuation arrangements. | Adds approximately `|S|^2` possibilities per two-symbol placement. |
 | Four case variants | Captures common casing without a large rule engine. | Misses mixed case, leetspeak, keyboard substitutions, and locale-specific transformations. |
 | Global `HashSet` suppression | Prevents redundant verification despite overlapping patterns/variants. | Uses memory proportional to all emitted candidates and rechecks excluded prefixes in later batches. |
-| Exact-length filter | Avoids sending obvious mismatches to the verifier. | Candidates are rendered before the length filter; no template-level feasibility pruning is used. |
+| Length-aware token-arity ordering | Brings the smallest fallback arity that can reach the requested/ranked length forward while preserving eventual coverage. | It is only a ranking/pruning aid; candidate-level Unicode/case-variant length checks remain necessary. |
 | Rayon parallel verifier | Uses available CPU cores and helps costly hash verification. | A new Rayon thread pool is constructed for each call/batch. |
-| `find_any` parallel match search | Minimises time to any match. | Reported rank can be nondeterministic if several candidates match, and the current `candidates_checked` is the full batch size rather than the number actually evaluated before a match. |
-| One model call per CLI run | Avoids repeated endpoint cost and changing semantic inputs during batch expansion. | A failed or paused endpoint blocks the run; the model response is not cached for replay. |
-| Suppressed verbose candidate logging | Prevents terminal leakage and avoids stdout becoming a major bottleneck; concise status remains available. | Full stream inspection now requires an explicitly generated output file or a controlled experiment fixture. |
+| `find_any` parallel match search | Minimises time to any match while exact started verification calls are counted. | Reported rank can still be nondeterministic if several candidates match; `actual_candidates_evaluated` is not a strict sequence rank. |
+| Suppressed verbose candidate logging | Prevents terminal leakage and avoids stdout becoming a major bottleneck; concise status remains available. | Full stream inspection now requires an explicitly generated output file. |
 
 ## 7. Current test suite and demonstrated edge cases
 
-The current local command `cargo test` passes **36 Rust unit tests**. There are no separate Rust integration tests, Python unit tests, end-to-end CLI tests, benchmark tests, or CI configuration in the present repository.
+The current local commands `cargo test` and `python -m unittest discover -s ai_logic -p "test_*.py"` pass **47 Rust unit tests** and **3 Python unit tests**. There are no separate Rust integration tests, benchmark tests, or CI configuration in the present repository.
 
 | Module | Tests | What is currently demonstrated |
 | --- | ---: | --- |
-| `src/search_space.rs` | 11 | Schema normalisation, unknown-field rejection, empty model pattern phase, grammar bounds, one/two-symbol boundary derivation, bounded generic number loading, and allowed-pattern-file validation/loading. |
-| `src/expander.rs` | 18 | Pattern weighting/order, batch deduplication, model-before-fallback ordering, ordered two-token expansion, punctuation placement, generic numeric ordering, independent two-symbol selection, year fragments, finite-batch equivalence, and candidate provenance. |
-| `src/cracker.rs` | 2 | MD5 verification/normalisation and supported-algorithm recognition. |
+| `src/search_space.rs` | 11 | Schema normalisation, unknown-field rejection, indexed-token grammar bounds, one/two-symbol boundary derivation, bounded generic number loading, and allowed-pattern-file/macro validation. |
+| `src/expander.rs` | 25 | Pattern weighting/order, model-first behavior, generated fallback closure, ordered two-/three-/six-token expansion, repeated-index semantics, length-aware arity ordering, punctuation placement, generic numeric ordering, independent two-symbol selection, year fragments, batch equivalence, and provenance. |
+| `src/cracker.rs` | 3 | MD5 verification/normalisation, supported-algorithm recognition, and submitted-versus-actually-evaluated verifier work with active-worker bounds. |
 | `src/hash_detect.rs` | 1 | Recognises supported hash shapes/prefixes. |
 | `src/telemetry.rs` | 1 | Serialises the self-contained run-record shape, including model artefacts and matched-candidate provenance. |
-| `src/main.rs` | 3 | Model-ranked lengths are followed by the complete supported `4..=32` range, the generation envelope is validated, and a match rank resolves to provenance. |
+| `src/main.rs` | 6 | Model-ranked lengths are followed by the complete supported `4..=32` range, the generation envelope honors the selected token-slot cap, a match rank resolves to provenance, and iterative generated/evaluated metrics aggregate independently. |
+| `ai_logic/test_generator.py` | 3 | Python validation accepts valid indexed token slots and rejects malformed/out-of-range indices before Rust receives the envelope. |
 
 ### Important regression scenarios already represented
 
 1. **Model pattern prioritisation.** Weighted patterns are sorted by descending weight, unweighted model patterns follow, and fallback/mutation phases occur later.
 2. **No duplicate candidates across batches.** A persistent excluded set makes finite batches produce the same unique stream as an exhaustive one-shot expansion in the tested fixture.
 3. **Two-token ordering.** All ordered pairs from combined primary and secondary token lists are explored, including both `A+B` and `B+A`.
-4. **Two-digit year fragments.** A four-digit model value such as `1999` makes `19` and `99` reachable after the original value, addressing common shortened-year suffixes while retaining model values first.
-5. **Model omission of numbers and symbols.** The Rajesh/Grower structural regression shows that the fallback phase contains the needed two-token-plus-number base, the compiled numeric list contains `123`, and the compiled punctuation list contains `.` and `@`.
-6. **Mixed two-symbol forms.** The renderer proves that two `{symbol}` slots can be chosen independently, allowing a form structurally equivalent to `Rajesh.Grower@123`.
-7. **Symbol positions.** One-symbol derivation covers before, between, and after every component. Two-symbol derivation covers each pair of positions, including adjacent symbols.
-8. **Case handling.** Expansion demonstrates lower/upper/capitalised variants and suppresses collisions among them.
-9. **Length coverage.** Ranked search uses model-suggested lengths before filling out the supported `4..=32` range; exact-length mode filters by Unicode character count.
-10. **Fast-hash normalisation.** A mixed-case MD5 target can be verified after normalisation.
+4. **Indexed token slots.** Three independent slots enumerate every ordered triple; repeated slot indices reuse their bound value; a six-slot model pattern can reach a six-component candidate.
+5. **Length-aware fallback arity.** A 25-character target with six-character tokens starts at the first arity that can reach that length instead of wasting the fallback prefix on impossible shorter structures.
+6. **Two-digit year fragments.** A four-digit model value such as `1999` makes `19` and `99` reachable after the original value, addressing common shortened-year suffixes while retaining model values first.
+7. **Model omission of numbers and symbols.** The Rajesh/Grower structural regression shows that the generated fallback phase contains the needed two-token-plus-number base, the compiled numeric list contains `123`, and the compiled punctuation list contains `.` and `@`.
+8. **Mixed two-symbol forms.** The renderer proves that two `{symbol}` slots can be chosen independently, allowing a form structurally equivalent to `Rajesh.Grower@123`.
+9. **Symbol positions.** One-symbol derivation covers before, between, and after every component. Two-symbol derivation covers each pair of positions, including adjacent symbols.
+10. **Case handling.** Expansion demonstrates lower/upper/capitalised variants and suppresses collisions among them.
+11. **Length coverage.** Ranked search uses model-suggested lengths before filling out the supported `4..=32` range; exact-length mode filters by Unicode character count.
+12. **Fast-hash normalisation.** A mixed-case MD5 target can be verified after normalisation.
 
 ### Observed edge-case lessons from project experiments
 
@@ -281,7 +284,7 @@ The tests mostly establish local construction and ordering properties. They do n
 
 1. **"Infinite" is finite.** The candidate stream ends after the fixed grammar, finite values, and lengths are exhausted. The CLI name and messaging should make this bounded-exhaustive meaning explicit.
 2. **Edited pattern files can narrow coverage.** `config/allowed_patterns.txt` is runtime-adjustable and syntax-validated, but validation cannot prove that a researcher-edited list remains candidate-complete for the bounded grammar. The shipped default is the coverage baseline; every experiment must snapshot the selected file.
-3. **Limited mutation language.** No token abbreviations, segmentation, transliteration, partial casing, leetspeak, word joins with literal separators, repeated numeric fields, or more than two punctuation characters are considered.
+3. **Limited mutation language.** No token abbreviations, segmentation, transliteration, partial casing, leetspeak, word joins with literal separators, repeated numeric fields, or more than two punctuation characters are considered. Token sequences are still bounded by the selected slot cap.
 4. **Token fidelity is decisive.** If the model returns `Inception` but the password uses `Incept`, no current deterministic rule bridges the gap.
 5. **Non-numeric model values can fill numeric slots.** Python preserves arbitrary model strings in `important_numbers`; the Rust renderer will insert them into `{number}`/`{year}`.
 6. **Only patterns are runtime-configurable.** `allowed_patterns.txt` is snapshotted at startup, but the symbol and generic-number alphabets still use `include_str!`; changing either requires a rebuild. Researchers must record both the chosen pattern file and the compiled artifact.
@@ -289,7 +292,7 @@ The tests mostly establish local construction and ordering properties. They do n
 
 ### Performance limitations
 
-1. **Combinatorial expansion.** Two token slots, numeric values, two independent symbols, four case variants, and many templates multiply rapidly. The bounded grammar contains the explosion but does not eliminate it.
+1. **Combinatorial expansion.** Up to `N` token slots, numeric values, two independent symbols, four case variants, and many templates multiply rapidly. Six supplied token values already yield `6^6 = 46,656` bindings for one six-slot template before numeric/symbol/case expansion. The bounded grammar contains the explosion but does not eliminate it.
 2. **Repeated prefix scanning.** Each iterative batch restarts ordered expansion and skips previously emitted values through the growing `HashSet`. A resumable cursor/iterator would avoid regenerating the prefix.
 3. **Memory grows with the search.** The excluded-candidate `HashSet<String>` retains every emitted candidate for the duration of iterative mode.
 4. **Full plaintext logging is expensive.** Logging every candidate can dominate runtime and expose experimental data.
@@ -299,8 +302,8 @@ The tests mostly establish local construction and ordering properties. They do n
 ### Measurement and reproducibility limitations
 
 1. **Parallel rank is not a strict rank.** `find_any` may return whichever worker finds a match first. If multiple candidates match, rank is not necessarily the earliest generated candidate.
-2. **Candidate count overstates work on a successful batch.** The telemetry records batch length as `candidates_checked`, not a precise count of hashes completed before cancellation.
-3. **Model artefacts are only partly captured.** The persona JSON, raw response, model identifier, and validated SearchSpace are now saved, but there is still no prompt hash, selected allowed-pattern content hash, symbol/number configuration hash, source commit, endpoint revision, operating system, CPU, or dependency-version snapshot.
+2. **Parallel count is not deterministic rank.** `actual_candidates_evaluated` accurately counts started verifier calls, including in-flight calls, but it does not identify the first candidate in the global deterministic stream that would match under sequential evaluation.
+3. **Model artefacts are only partly captured.** Run records capture the persona, raw response, and SearchSpace, but there is still no prompt hash, selected allowed-pattern content hash, symbol/number configuration hash, source commit, endpoint revision, operating system, CPU model, or dependency-version snapshot.
 4. **Endpoint determinism is incomplete.** `temperature=0` reduces sampling variation but cannot guarantee reproducibility across model revisions, inference backends, or availability events such as a paused endpoint.
 5. **Documentation drift exists.** The README describes a different default model route than `generator.py`, its SearchSpace example omits currently expected fields, and the CLI version string differs from the Cargo package version. These must be reconciled before using the repository documentation as a methodological source.
 6. **Sensitive artefacts are stored/logged.** Target hashes and generated candidates can be sensitive research data. Public artefacts need data minimisation and access controls.
@@ -326,8 +329,8 @@ Use the same synthetic target set, exact token sources, fixed length policy, and
 | Semantic + fallback | Current model-first base behaviour without symbol/numeric extras. |
 | + Year fragments | Adds the deterministic four-digit-to-two-digit rule. |
 | + Generic numbers | Adds `config/numbers.txt`. |
-| + One symbol | Adds phase-4 mutations. |
-| + Two symbols | Adds phase-5 mutations. |
+| + One symbol | Adds phase-5 mutations. |
+| + Two symbols | Adds phase-6 mutations. |
 | Full system | Current bounded pipeline. |
 
 For each target, record whether it is reached at budget `k`, its first deterministic candidate position, wall-clock time, generation time, verification time, unique candidate count, duplicate rate, source phase, source pattern, token provenance, numeric provenance, and symbol provenance. Do not compare raw candidates-per-second between SHA-512 and bcrypt as a measure of semantic quality; evaluator cost is a separate factor.
@@ -338,7 +341,7 @@ For each target, record whether it is reached at budget `k`, its first determini
 - Stratify targets by construction family: single/two tokens, year forms, common numeric suffixes, one symbol, mixed two symbols, case variants, and deliberately unsupported forms such as abbreviations.
 - Include negative controls that are intentionally outside the grammar. Report them as coverage limits, not as unexplained failures.
 - Freeze the code commit, compiled binary hash, model revision, endpoint configuration, prompt text, persona JSON, configuration file contents, Python/Rust dependency locks, OS, CPU model, thread count, hash algorithm, and bcrypt/Argon2 parameters.
-- Cache the raw model response and validated SearchSpace for every run. Replaying a cached SearchSpace must reproduce the candidate stream without network access.
+- Archive the raw model response and validated SearchSpace for every run, together with the inputs and configuration needed to reproduce it.
 - Repeat model requests for the same persona and quantify output variation. If an endpoint is unavailable, analyse it as a deployment/reproducibility failure rather than silently substituting a different result.
 - Use paired statistical analysis over the same targets, report confidence intervals, show censored no-match results at the chosen budget, and publish both aggregate and per-construction-family outcomes.
 
@@ -358,9 +361,9 @@ For each target, record whether it is reached at budget `k`, its first determini
 ### Priority 0: make the current experiment trustworthy
 
 1. Rename or document iterative mode as **bounded exhaustive mode**, and print its exact grammar/value/length bounds before running.
-2. Cache the persona, prompt hash, raw model response, validated SearchSpace, model identifier, endpoint identity, selected allowed-pattern file, and configuration hashes. Add a replay mode that bypasses the network.
+2. Capture prompt hash, endpoint/revision identity, selected allowed-pattern content, symbol/number configuration hashes, source commit, and machine/dependency snapshots.
 3. Record candidate provenance and a strict deterministic sequence number. Replace or supplement `find_any` with deterministic earliest-index reporting when research rank is the outcome.
-4. Count actual verifier work, distinguish generated/emitted/verified candidates, and validate malformed bcrypt/Argon2 hashes before a run.
+4. Retain the new generated-versus-actually-evaluated verifier metrics, add a strict deterministic sequence number, and validate malformed bcrypt/Argon2 hashes before a run.
 5. Keep verbose candidate logging disabled by default; add an explicit, redacted, capped diagnostic mode only if a controlled experiment needs stream inspection.
 6. Reconcile README, CLI, Cargo, prompt, and schema versions. In particular, resolve the model-default discrepancy and the prompt sentence claiming every field is an array of strings despite integer lengths and an object of weights.
 
